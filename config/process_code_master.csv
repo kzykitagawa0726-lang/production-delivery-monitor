@@ -1,0 +1,11 @@
+# 工程コード対応表(PDF由来の実データ待ちのテンプレートです)
+# 実際の工程コード対応表PDFが届いたら、process_code / category / is_bottleneck を実データで置き換えてください。
+# category は config/process_categories.json の categories キーのいずれかを指定します(熱処理系/歯切り系/研磨系/検査/その他)。
+# is_bottleneck が true の行はボトルネック工程(例: ウォーム・スプライン・歯研系)として混雑ランキングで強調表示されます。
+# 以下はフォーマット確認用のサンプル行です。実データ到着後にすべて置き換えてください。
+process_code,category,note,is_bottleneck
+SAMPLE_H01,熱処理系,サンプル: 浸炭焼入,false
+SAMPLE_G01,歯切り系,サンプル: ホブ切り,false
+SAMPLE_G02,歯切り系,サンプル: 歯研(ボトルネック想定),true
+SAMPLE_P01,研磨系,サンプル: 内径研磨,false
+SAMPLE_I01,検査,サンプル: 最終検査,false
