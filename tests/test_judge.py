@@ -1,62 +1,54 @@
 import datetime
 
-from src.judge import DEADLINE_PLACEHOLDER, judge_record
+from src.judge import RISK_THRESHOLD_BUSINESS_DAYS, judge_record
 from src.models import Judgement, OrderRecord
-
-BASE_DATE = datetime.date(2026, 8, 3)  # Mon
 
 
 def make_record(**overrides) -> OrderRecord:
     defaults = dict(
-        order_no="ORD-0001",
-        drawing_no="DWG-0001",
-        qty=10,
-        order_date=datetime.date(2026, 6, 1),
+        order_no="PO-000001",
+        drawing_no="312127272601",
+        product_name="SPB M10x13T L",
+        qty=1,
         company_deadline=datetime.date(2026, 9, 1),
-        total_process_count=5,
-        process_seq=2,
-        process_code="SAMPLE_G01",
-        all_process_complete_flag=0,
-        current_process_standard_lt=5,
+        remaining_business_days=20,
     )
     defaults.update(overrides)
     return OrderRecord(**defaults)
 
 
-def test_delayed_when_past_deadline():
-    record = make_record(company_deadline=datetime.date(2026, 7, 1))
-    judge_record(record, BASE_DATE)
+def test_delayed_when_remaining_days_negative():
+    record = make_record(remaining_business_days=-5)
+    judge_record(record)
     assert record.judgement == Judgement.DELAYED
-    assert record.remaining_business_days_to_deadline < 0
+    assert "5営業日超過" in record.judgement_reason
 
 
-def test_at_risk_when_insufficient_time():
-    # 残工程数=3(5-2), 残必要日数=3*5+5=20営業日。納期まで数営業日しかない場合はリスクあり
-    record = make_record(company_deadline=datetime.date(2026, 8, 6))  # Thu, 3 business days out
-    judge_record(record, BASE_DATE)
+def test_at_risk_when_within_threshold():
+    record = make_record(remaining_business_days=RISK_THRESHOLD_BUSINESS_DAYS)
+    judge_record(record)
     assert record.judgement == Judgement.AT_RISK
 
 
-def test_normal_when_enough_time():
-    record = make_record(company_deadline=datetime.date(2026, 12, 1))
-    judge_record(record, BASE_DATE)
+def test_normal_when_beyond_threshold():
+    record = make_record(remaining_business_days=RISK_THRESHOLD_BUSINESS_DAYS + 1)
+    judge_record(record)
     assert record.judgement is None
-
-
-def test_undetermined_when_deadline_is_placeholder():
-    record = make_record(company_deadline=DEADLINE_PLACEHOLDER)
-    judge_record(record, BASE_DATE)
-    assert record.judgement == Judgement.UNDETERMINED
-    assert record.is_deadline_placeholder is True
-
-
-def test_undetermined_when_total_process_count_zero():
-    record = make_record(total_process_count=0)
-    judge_record(record, BASE_DATE)
-    assert record.judgement == Judgement.UNDETERMINED
 
 
 def test_undetermined_when_deadline_missing():
     record = make_record(company_deadline=None)
-    judge_record(record, BASE_DATE)
+    judge_record(record)
     assert record.judgement == Judgement.UNDETERMINED
+
+
+def test_undetermined_when_remaining_days_missing():
+    record = make_record(remaining_business_days=None)
+    judge_record(record)
+    assert record.judgement == Judgement.UNDETERMINED
+
+
+def test_boundary_zero_is_at_risk():
+    record = make_record(remaining_business_days=0)
+    judge_record(record)
+    assert record.judgement == Judgement.AT_RISK
