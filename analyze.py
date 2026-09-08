@@ -13,8 +13,10 @@
 いずれも行数が多く読み込みに時間がかかるため、集計結果を .cache/ にキャッシュし、
 同じファイル一式であれば2回目以降は高速化される。
 
-実行のたびに output/YYYYMMDD/ フォルダを作成し、Excel(5〜6シート)と
-オフラインHTMLレポートを出力する。外部API・外部通信は使用しない。
+実行のたびに output/YYYYMMDD/ フォルダを作成し、Excel(5〜16シート)を出力する。
+外部API・外部通信は使用しない。
+(2026-09-08 kii-san要望によりHTMLレポートの出力は廃止。src/report_html.py自体は
+将来また必要になった場合に備えて残しているが、analyze.pyからは呼び出さない)
 """
 from __future__ import annotations
 
@@ -28,9 +30,7 @@ from src.judge import judge_record
 from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
 from src.product_category import ProductCategoryClassifier
-from src.report_data import build_report_data
 from src.report_excel import write_excel_report
-from src.report_html import write_html_report
 from src.supplier_history import SupplierHistory
 
 
@@ -50,16 +50,11 @@ def run(
     for order in orders:
         judge_record(order)
 
-    report_data = build_report_data(
-        orders, today, process_master, supplier_history, process_history, product_category_classifier
-    )
-
     output_dir = output_root / today.strftime("%Y%m%d")
     write_excel_report(
         orders, output_dir / "production_delivery_report.xlsx", today,
         process_master, supplier_history, process_history, product_category_classifier,
     )
-    write_html_report(report_data, output_dir / "production_delivery_report.html")
 
     return output_dir
 
