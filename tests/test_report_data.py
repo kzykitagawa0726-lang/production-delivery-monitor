@@ -22,58 +22,37 @@ def make_order(**overrides) -> OrderRecord:
     return OrderRecord(**defaults)
 
 
-def make_history_with_durations(durations: dict[str, list[int]]) -> ProcessHistory:
+def make_history_with_order_level_lt(drawing_no: str, days: int, sample_count: int = 1) -> ProcessHistory:
     history = ProcessHistory()
-    for code, values in durations.items():
-        history._actual_durations[code] = list(values)
+    history._order_level_durations_by_drawing[drawing_no] = [days] * sample_count
     return history
 
 
-def test_feasibility_sums_remaining_step_durations():
+def test_feasibility_uses_order_date_plus_drawing_typical_lt():
     order = make_order(
-        processes=[
-            ProcessStep(2, "L0", "F1", "d1", "d2", "作業完了"),  # 完了済みなので合計に含めない
-            ProcessStep(3, "HG", "F2", "d1", "d2", "オーダー確定前"),
-            ProcessStep(4, "CH", "F3", "d1", "d2", "オーダー確定前"),
-        ],
+        order_date=datetime.date(2026, 8, 1),
+        processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
     )
-    history = make_history_with_durations({"HG": [10], "CH": [4]})
+    history = make_history_with_order_level_lt("DWG-A1", days=14)
 
     entries = build_feasibility_estimates([order], GENERATED_AT, history)
 
     assert len(entries) == 1
     e = entries[0]
-    assert e.predicted_remaining_calendar_days == 14
-    assert e.predicted_completion_date == GENERATED_AT + datetime.timedelta(days=14)
+    assert e.typical_total_lt_calendar_days == 14
+    assert e.typical_lt_sample_count == 1
+    assert e.predicted_completion_date == datetime.date(2026, 8, 15)  # 8/1 + 14日
     assert e.margin_days == (order.customer_deadline - e.predicted_completion_date).days
-    assert e.missing_process_codes == []
-    assert e.status in ("間に合う見込み", "間に合わない見込み")
-
-
-def test_feasibility_flags_missing_data_but_still_sums_known_steps():
-    order = make_order(
-        processes=[
-            ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前"),
-            ProcessStep(3, "ZZ", "F3", "d1", "d2", "オーダー確定前"),  # 実績データなし
-        ],
-    )
-    history = make_history_with_durations({"HG": [10]})
-
-    entries = build_feasibility_estimates([order], GENERATED_AT, history)
-
-    assert len(entries) == 1
-    e = entries[0]
-    assert e.predicted_remaining_calendar_days == 10  # 分かる工程だけの合計(下限値)
-    assert e.missing_process_codes == ["ZZ"]
-    assert e.predicted_completion_date is not None
+    assert e.data_note is None
 
 
 def test_feasibility_status_reflects_margin():
     order = make_order(
-        customer_deadline=GENERATED_AT + datetime.timedelta(days=3),
+        order_date=datetime.date(2026, 9, 1),
+        customer_deadline=datetime.date(2026, 9, 5),
         processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
     )
-    history = make_history_with_durations({"HG": [10]})  # 10日かかる予測 vs 納期まで3日
+    history = make_history_with_order_level_lt("DWG-A1", days=30)  # 30日かかる想定 vs 納期まで4日
 
     entries = build_feasibility_estimates([order], GENERATED_AT, history)
     assert entries[0].status == "間に合わない見込み"
@@ -85,7 +64,7 @@ def test_feasibility_excludes_orders_without_customer_deadline():
         customer_deadline=None,
         processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
     )
-    history = make_history_with_durations({"HG": [10]})
+    history = make_history_with_order_level_lt("DWG-A1", days=10)
 
     entries = build_feasibility_estimates([order], GENERATED_AT, history)
     assert entries == []
@@ -95,15 +74,16 @@ def test_feasibility_excludes_orders_with_no_current_process():
     order = make_order(
         processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "作業完了")],  # 全工程完了
     )
-    history = make_history_with_durations({"HG": [10]})
+    history = make_history_with_order_level_lt("DWG-A1", days=10)
 
     entries = build_feasibility_estimates([order], GENERATED_AT, history)
     assert entries == []
 
 
-def test_feasibility_reports_no_data_when_all_remaining_steps_unknown():
+def test_feasibility_reports_no_data_when_drawing_has_no_order_level_history():
     order = make_order(
-        processes=[ProcessStep(2, "ZZ", "F2", "d1", "d2", "オーダー確定前")],
+        drawing_no="DWG-UNKNOWN",
+        processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
     )
     history = ProcessHistory()  # 実績データなし
 
@@ -111,24 +91,43 @@ def test_feasibility_reports_no_data_when_all_remaining_steps_unknown():
     assert len(entries) == 1
     assert entries[0].predicted_completion_date is None
     assert entries[0].status == "データ不足"
+    assert "受注〜完成実績が" in entries[0].data_note
+
+
+def test_feasibility_reports_no_data_when_order_date_missing():
+    # 内示・先行手配案件など、受注日が無いと起点が分からず予測できない
+    order = make_order(
+        order_date=None,
+        processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
+    )
+    history = make_history_with_order_level_lt("DWG-A1", days=10)
+
+    entries = build_feasibility_estimates([order], GENERATED_AT, history)
+    assert len(entries) == 1
+    assert entries[0].predicted_completion_date is None
+    assert entries[0].status == "データ不足"
+    assert "受注日が不明" in entries[0].data_note
 
 
 def test_feasibility_sorts_most_urgent_first_and_missing_data_last():
     late_order = make_order(
         order_no="PO-LATE",
-        customer_deadline=GENERATED_AT + datetime.timedelta(days=1),
+        order_date=datetime.date(2026, 9, 1),
+        customer_deadline=datetime.date(2026, 9, 3),
         processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
     )
     ontime_order = make_order(
         order_no="PO-ONTIME",
-        customer_deadline=GENERATED_AT + datetime.timedelta(days=30),
+        order_date=datetime.date(2026, 9, 1),
+        customer_deadline=datetime.date(2026, 12, 1),
         processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
     )
     unknown_order = make_order(
         order_no="PO-UNKNOWN",
-        processes=[ProcessStep(2, "ZZ", "F2", "d1", "d2", "オーダー確定前")],
+        drawing_no="DWG-UNKNOWN",
+        processes=[ProcessStep(2, "HG", "F2", "d1", "d2", "オーダー確定前")],
     )
-    history = make_history_with_durations({"HG": [10]})
+    history = make_history_with_order_level_lt("DWG-A1", days=10)
 
     entries = build_feasibility_estimates([ontime_order, unknown_order, late_order], GENERATED_AT, history)
 

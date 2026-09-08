@@ -58,6 +58,7 @@ def test_write_excel_report_adds_process_history_sheets(tmp_path):
 
     process_history = ProcessHistory()
     process_history._actual_durations["HB"] = [10]
+    process_history._order_level_durations_by_drawing["312127272601"] = [10]
     process_history._weekly_load_by_department[(datetime.date(2026, 8, 31), "1223")] = 12.5
     process_history._weekly_load_by_machine[(datetime.date(2026, 8, 31), "F1")] = 12.5
 

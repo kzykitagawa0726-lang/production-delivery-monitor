@@ -266,22 +266,23 @@ def _write_supplier_ranking_sheet(ws: Worksheet, data: ReportData) -> None:
 
 
 def _write_feasibility_sheet(ws: Worksheet, data: ReportData) -> None:
-    """残り工程の実績LTを積み上げた客先納期充足予測(--process-data指定時のみ)。
+    """図番単位の受注〜完成実績から算出した客先納期充足予測(--process-data指定時のみ)。
 
     ①②(自社納期・残日ベース)の判定とは独立した参考情報。margin_days昇順
     (間に合わない見込み・データ不足が上に来る)。
     """
     headers = [
-        "製造オーダー№", "図番", "品名", "顧客納期", "現在工程", "残り工程数",
-        "予測残日数(暦日)", "予測完了日", "余裕日数(顧客納期-予測完了日)", "判定", "実績データ不足の工程",
+        "製造オーダー№", "図番", "品名", "受注日", "顧客納期", "現在工程", "残り工程数",
+        "図番実績LT中央値(暦日)", "実績件数", "予測完了日(受注日+実績LT)",
+        "余裕日数(顧客納期-予測完了日)", "判定", "備考",
     ]
     _write_header_row(ws, headers)
     rows: list[tuple] = []
     for r_idx, e in enumerate(data.feasibility_estimates, start=2):
         row = (
-            e.order_no, e.drawing_no, e.product_name, e.customer_deadline, e.current_process_code,
-            e.remaining_step_count, e.predicted_remaining_calendar_days, e.predicted_completion_date,
-            e.margin_days, e.status, ", ".join(e.missing_process_codes) or None,
+            e.order_no, e.drawing_no, e.product_name, e.order_date, e.customer_deadline, e.current_process_code,
+            e.remaining_step_count, e.typical_total_lt_calendar_days, e.typical_lt_sample_count,
+            e.predicted_completion_date, e.margin_days, e.status, e.data_note,
         )
         rows.append(row)
         for c_idx, value in enumerate(row, start=1):
@@ -298,8 +299,9 @@ def _write_feasibility_sheet(ws: Worksheet, data: ReportData) -> None:
         row=note_row, column=1,
         value=(
             "※ この予測は①②の判定(自社納期・残日ベース)とは独立した参考情報です。"
-            "残り工程の実績LT(暦日)を積み上げて予測完了日を算出し、顧客納期と比較しています。"
-            "実績データ不足の工程がある行は、予測が過小評価(=実際はもっとかかる)の可能性があります。"
+            "その図番が過去に実際「受注(最初の着手)〜完成(最後の完成)」でどれだけかかったか(実績LT中央値)を"
+            "受注日に足して予測完了日を算出し、顧客納期と比較しています(残り工程数による比例配分はしていません)。"
+            "実績件数が少ない行(1〜2件)は参考程度にご覧ください。"
         ),
     )
     ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")

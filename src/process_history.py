@@ -7,11 +7,21 @@ kii-san提供の複数年分の工程実績Excel(基幹システムからのエ�
 
   1. 代替候補設備の提示(社内)
   2. 実績LTの参考表示(標準LTは変更しない)
-  3. 図番を指定した際の実績ベースLT予測(工程順の中央値でルートを推定し、
-     各工程の実績日数を合計する)
-  4. 進行中の受注について、残り工程の実績LTを積み上げて客先納期に
-     間に合いそうかを予測する(report_data.pyのfeasibility計算が使用)
+  3. 図番を指定した際の実績ベースLT予測
+  4. 進行中の受注について、客先納期に間に合いそうかを予測する
+     (report_data.pyのfeasibility計算が使用)
   5. 週別・部署別/設備別の負荷(実績総工数)の可視化用データ
+
+  【2026-09-08 実データ検証で発覚した設計変更】3・4は当初、工程コードごとの
+  実績LT(着手日〜完成日)を残り工程数分「単純合計」していたが、実データでは
+  残り工程が10件超の受注で合計が数千日規模になる異常値が頻発した。各工程の
+  実績日数には他案件との順番待ち時間が相当含まれており、工程コード単位の
+  中央値を寄せ集めても、その受注が実際に要する通しの期間を表さないため。
+  → kii-san合意により、図番単位で「受注ごとのインスタンス(受注№+行が
+  同じ工程群)の最初の着手日〜最後の完成日」を1つの実績値とし、その中央値
+  (order_level_lt_calendar_days_median)を使う設計に変更した。工程別の内訳
+  (estimate_route_for_drawingのsteps)は参考情報として残すが、合計値の主役は
+  図番単位の通し実績に置き換えている。
 
 - 図番と工程コードの組み合わせが紐付けの最優先(kii-san指摘: 2026-09-08。
   図番だけで一致させると、その図番の別の工程を担当しただけの設備まで
@@ -46,9 +56,10 @@ from src.process_master import normalize_process_code
 DEFAULT_CACHE_PATH = Path(".cache/process_history.json")
 # 集計ロジックを変更したら上げる。ソースファイルが同じでもキャッシュを無効化し、
 # 古いロジックで集計された結果を誤って使い続けないようにするためのガード。
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 
 IDX_ORDER_NO = 0
+IDX_LINE = 1  # 行(受注№と組み合わせて1つの工程ルート=インスタンスを識別)
 IDX_PROC_SEQ = 2  # 工程順
 IDX_DRAWING = 3
 IDX_PROC_CODE = 5
@@ -86,9 +97,14 @@ class RouteStepEstimate:
 @dataclass
 class DrawingLtEstimate:
     drawing_no: str
-    steps: list[RouteStepEstimate] = field(default_factory=list)
-    total_calendar_days: Optional[float] = None  # 実績が分かる工程だけの合計(下限値)
-    missing_process_codes: list[str] = field(default_factory=list)
+    steps: list[RouteStepEstimate] = field(default_factory=list)  # 工程別の内訳(参考情報)
+    total_calendar_days: Optional[float] = None
+    # True: 図番単位の「受注(最初の着手)〜完成(最後の完成)」実績の中央値(信頼度が高い)。
+    # False: その実績が1件も無いためのフォールバックで、工程別実績LTの単純合計(残り工程が
+    #        多い受注では過大評価になりやすいので注意)。
+    total_is_order_level: bool = False
+    total_sample_count: int = 0  # 合計値の根拠になった実績件数
+    missing_process_codes: list[str] = field(default_factory=list)  # 工程別内訳で実績が無かった工程(参考)
 
     @property
     def has_full_data(self) -> bool:
@@ -133,6 +149,11 @@ class ProcessHistory:
         self._weekly_load_by_department: dict[tuple[datetime.date, str], float] = defaultdict(float)
         # weekly_load_by_machine[(週初め, 設備コード)] = 実績工数合計
         self._weekly_load_by_machine: dict[tuple[datetime.date, str], float] = defaultdict(float)
+        # order_level_durations_by_drawing[図番] = [実日数, ...]
+        # (受注№+行が同じ工程群を1インスタンスとし、最初の着手日〜最後の完成日を1件の実績とする)
+        self._order_level_durations_by_drawing: dict[str, list[int]] = defaultdict(list)
+        # _ingest_file中の一時集計。全ファイル読み込み後にfinalizeして上記に変換し、破棄する。
+        self._instance_bounds: dict[tuple[str, str], dict] = {}
 
     @classmethod
     def load(cls, paths: list[Path], cache_path: Path = DEFAULT_CACHE_PATH) -> "ProcessHistory":
@@ -144,6 +165,7 @@ class ProcessHistory:
         history = cls()
         for path in paths:
             history._ingest_file(path)
+        history._finalize_order_level_durations()
         _save_cache(cache_path, signature, history)
         return history
 
@@ -198,6 +220,31 @@ class ProcessHistory:
                         self._weekly_load_by_department[(week, department)] += manhours
                     if machine:
                         self._weekly_load_by_machine[(week, machine)] += manhours
+
+            order_no = str(row[IDX_ORDER_NO]).strip() if row[IDX_ORDER_NO] not in (None, "") else None
+            line = str(row[IDX_LINE]).strip() if row[IDX_LINE] not in (None, "") else None
+            if order_no and line and (drawing_no or start_date or complete_date):
+                key = (order_no, line)
+                bounds = self._instance_bounds.setdefault(
+                    key, {"drawing": None, "min_start": None, "max_complete": None}
+                )
+                if drawing_no and bounds["drawing"] is None:
+                    bounds["drawing"] = drawing_no
+                if start_date and (bounds["min_start"] is None or start_date < bounds["min_start"]):
+                    bounds["min_start"] = start_date
+                if complete_date and (bounds["max_complete"] is None or complete_date > bounds["max_complete"]):
+                    bounds["max_complete"] = complete_date
+
+    def _finalize_order_level_durations(self) -> None:
+        """全ファイル読み込み後に1回呼ぶ。インスタンス(受注№+行)ごとの最初の着手日〜
+        最後の完成日を、その図番の「受注〜完成」実績1件として確定する。"""
+        for bounds in self._instance_bounds.values():
+            drawing = bounds["drawing"]
+            start = bounds["min_start"]
+            complete = bounds["max_complete"]
+            if drawing and start and complete and complete >= start:
+                self._order_level_durations_by_drawing[drawing].append((complete - start).days)
+        self._instance_bounds = {}  # 中間データは不要(キャッシュにも含めない)
 
     # --- 代替候補設備(社内) ---
 
@@ -255,18 +302,38 @@ class ProcessHistory:
             return None
         return statistics.median(durations)
 
+    def order_level_lt_calendar_days_median(self, drawing_no: str) -> Optional[float]:
+        """図番単位の「受注(最初の着手)〜完成(最後の完成)」実績日数の中央値(暦日)。
+
+        工程別実績LTの単純合計とは違い、1受注インスタンスの通しの実績値そのものなので、
+        工程数の多寡による過大評価が起きない。予測の主役として使う(kii-san合意: 2026-09-08)。
+        """
+        durations = self._order_level_durations_by_drawing.get(drawing_no)
+        if not durations:
+            return None
+        return statistics.median(durations)
+
+    def order_level_lt_sample_count(self, drawing_no: str) -> int:
+        return len(self._order_level_durations_by_drawing.get(drawing_no, []))
+
     def estimate_route_for_drawing(self, drawing_no: str) -> Optional[DrawingLtEstimate]:
-        """図番の典型的な工程ルート(工程順の中央値でソート)と、各工程の実績LTを推定する。"""
+        """図番の典型的な工程ルート(工程順の中央値でソート)と、各工程の実績LTを推定する。
+
+        合計値(total_calendar_days)は、図番単位の受注〜完成実績があればその中央値を
+        優先して使う(total_is_order_level=True)。無ければ工程別実績LTの単純合計に
+        フォールバックする(total_is_order_level=False。残り工程が多いほど過大評価になりやすい)。
+        """
         codes = self._drawing_process_codes.get(drawing_no)
-        if not codes:
+        order_level_durations = self._order_level_durations_by_drawing.get(drawing_no)
+        if not codes and not order_level_durations:
             return None
 
         steps: list[RouteStepEstimate] = []
         missing: list[str] = []
-        total = 0.0
+        summed = 0.0
         any_known = False
 
-        for code in codes:
+        for code in codes or ():
             seqs = self._seq_by_drawing_process.get((drawing_no, code))
             typical_seq = statistics.median(seqs) if seqs else float("inf")
 
@@ -283,16 +350,28 @@ class ProcessHistory:
             if lt is None:
                 missing.append(code)
             else:
-                total += lt
+                summed += lt
                 any_known = True
 
             steps.append(RouteStepEstimate(code, typical_seq, lt, sample_count, is_specific))
 
         steps.sort(key=lambda s: s.typical_seq)
+
+        if order_level_durations:
+            total = statistics.median(order_level_durations)
+            is_order_level = True
+            total_sample_count = len(order_level_durations)
+        else:
+            total = summed if any_known else None
+            is_order_level = False
+            total_sample_count = 0
+
         return DrawingLtEstimate(
             drawing_no=drawing_no,
             steps=steps,
-            total_calendar_days=total if any_known else None,
+            total_calendar_days=total,
+            total_is_order_level=is_order_level,
+            total_sample_count=total_sample_count,
             missing_process_codes=missing,
         )
 
@@ -347,6 +426,7 @@ class ProcessHistory:
                 f"{week.isoformat()}\x1f{machine}": hours
                 for (week, machine), hours in self._weekly_load_by_machine.items()
             },
+            "order_level_durations_by_drawing": dict(self._order_level_durations_by_drawing),
         }
 
     @classmethod
@@ -379,6 +459,8 @@ class ProcessHistory:
         for key, hours in payload["weekly_load_by_machine"].items():
             week_iso, machine = key.split("\x1f", 1)
             history._weekly_load_by_machine[(datetime.date.fromisoformat(week_iso), machine)] = hours
+        for drawing, durations in payload.get("order_level_durations_by_drawing", {}).items():
+            history._order_level_durations_by_drawing[drawing] = list(durations)
         return history
 
 

@@ -26,22 +26,32 @@ class CongestionEntry:
 
 @dataclass
 class FeasibilityEntry:
-    """進行中の受注について、残り工程の実績LTを積み上げた客先納期充足予測。
+    """進行中の受注について、図番単位の「受注〜完成」実績日数から客先納期充足を予測する。
 
     ①②の判定(自社納期・残日ベース)とは独立した、追加の参考情報。
     --process-data指定時のみ算出される。
+
+    【2026-09-08 実データ検証で設計変更】当初は残り工程ごとの実績LT(暦日)を
+    単純合計していたが、各工程の実績日数には他案件との待ち時間が相当含まれており、
+    残り工程が多い受注では合計が数千日規模になる異常値が実データで頻発した。
+    → kii-san合意により、図番単位の「受注(最初の着手)〜完成(最後の完成)」実績日数
+    (ProcessHistory.order_level_lt_calendar_days_median)を使う設計に変更。
+    自社の受注日(order_date)を起点に、その図番が過去に実際どれだけかかったかの
+    中央値を足して予測完了日とする(残り工程数による比例配分はしない。シンプルさを優先)。
     """
 
     order_no: str
     drawing_no: str
     product_name: str | None
+    order_date: datetime.date | None
     customer_deadline: datetime.date
     current_process_code: str
     remaining_step_count: int
-    predicted_remaining_calendar_days: float | None  # 実績データが1件もなければNone
-    predicted_completion_date: datetime.date | None
+    typical_total_lt_calendar_days: float | None  # 図番単位の受注〜完成 実績中央値(暦日)
+    typical_lt_sample_count: int  # 何件の過去実績から算出したか
+    predicted_completion_date: datetime.date | None  # 受注日 + typical_total_lt
     margin_days: int | None  # 顧客納期 - 予測完了日。正=間に合う見込み、負=間に合わない見込み
-    missing_process_codes: list[str] = field(default_factory=list)
+    data_note: str | None = None  # 予測不可の理由(データ不足の場合)
 
     @property
     def status(self) -> str:
@@ -162,10 +172,12 @@ def build_feasibility_estimates(
     generated_at: datetime.date,
     process_history: ProcessHistory,
 ) -> list[FeasibilityEntry]:
-    """進行中の全受注について、残り工程の実績LTを積み上げた客先納期充足予測を作る。
+    """進行中の全受注について、図番単位の受注〜完成実績から客先納期充足予測を作る。
 
     ①②(自社納期・残日ベース)の判定とは独立(kii-san合意)。対象は
     「現在工程があり、かつ顧客納期が分かっている」受注のみ(それ以外は比較対象なしのため対象外)。
+    受注日が不明(内示・先行手配案件など)、またはその図番の受注〜完成実績が
+    1件もない場合は「データ不足」として予測日を出さない(誤って安全側に見せない)。
     margin_days(顧客納期 - 予測完了日)が小さい(=危険な)順に並べる。データ不足は最後。
     """
     entries: list[FeasibilityEntry] = []
@@ -174,22 +186,18 @@ def build_feasibility_estimates(
         if current is None or r.customer_deadline is None:
             continue
 
-        remaining_steps = [s for s in r.processes if not s.is_completed]
-        total_days = 0.0
-        missing: list[str] = []
-        any_known = False
-        for step in remaining_steps:
-            lt = process_history.actual_lt_calendar_days_median(step.process_code, r.drawing_no)
-            if lt is None:
-                missing.append(step.process_code)
-            else:
-                total_days += lt
-                any_known = True
+        typical_lt = process_history.order_level_lt_calendar_days_median(r.drawing_no)
+        sample_count = process_history.order_level_lt_sample_count(r.drawing_no)
 
-        predicted_days = total_days if any_known else None
-        predicted_date = (
-            generated_at + datetime.timedelta(days=round(predicted_days)) if predicted_days is not None else None
-        )
+        predicted_date: datetime.date | None = None
+        data_note: str | None = None
+        if typical_lt is None:
+            data_note = "この図番の受注〜完成実績が工程累積データに無いため予測不可"
+        elif r.order_date is None:
+            data_note = "受注日が不明(内示・先行手配案件等)のため予測不可"
+        else:
+            predicted_date = r.order_date + datetime.timedelta(days=round(typical_lt))
+
         margin = (r.customer_deadline - predicted_date).days if predicted_date is not None else None
 
         entries.append(
@@ -197,13 +205,15 @@ def build_feasibility_estimates(
                 order_no=r.order_no,
                 drawing_no=r.drawing_no,
                 product_name=r.product_name,
+                order_date=r.order_date,
                 customer_deadline=r.customer_deadline,
                 current_process_code=current.process_code,
-                remaining_step_count=len(remaining_steps),
-                predicted_remaining_calendar_days=predicted_days,
+                remaining_step_count=sum(1 for s in r.processes if not s.is_completed),
+                typical_total_lt_calendar_days=typical_lt,
+                typical_lt_sample_count=sample_count,
                 predicted_completion_date=predicted_date,
                 margin_days=margin,
-                missing_process_codes=missing,
+                data_note=data_note,
             )
         )
 
