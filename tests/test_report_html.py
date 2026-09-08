@@ -65,5 +65,25 @@ def test_write_html_report_shows_feasibility_and_weekly_load(tmp_path):
 
     content = output_path.read_text(encoding="utf-8")
     assert "実績ベースで納期に間に合わない見込み" in content
-    assert "週別負荷" in content
+    assert "週別負荷実績" in content
     assert "部署1223" in content
+
+
+def test_write_html_report_shows_capacity_forecast_distinct_from_actuals(tmp_path):
+    record = make_judged_record(order_no="ORD-RISK", remaining_business_days=2)  # 現在工程=CR
+
+    process_history = ProcessHistory()
+    process_history._manhours_by_process["CR"] = [4.0]
+    process_history._department_counts_by_process["CR"]["9999"] += 1
+    # 実績側は別の部署にしておき、予測と実績が混同されずに別セクションへ出ることを確認する
+    process_history._weekly_load_by_department[(datetime.date(2026, 7, 27), "1223")] = 12.5
+
+    data = build_report_data([record], BASE_DATE, ProcessMaster(), process_history=process_history)
+    output_path = tmp_path / "report.html"
+
+    write_html_report(data, output_path)
+
+    content = output_path.read_text(encoding="utf-8")
+    assert "週別予測負荷" in content
+    assert "部署9999" in content  # 予測側の部署ラベル
+    assert content.index("週別予測負荷") < content.index("週別負荷実績")  # 予測を先に見せる構成

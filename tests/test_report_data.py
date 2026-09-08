@@ -2,9 +2,25 @@ import datetime
 
 from src.models import OrderRecord, ProcessStep
 from src.process_history import ProcessHistory
-from src.report_data import build_feasibility_estimates
+from src.process_master import ProcessMaster
+from src.report_data import build_capacity_forecast, build_feasibility_estimates
 
-GENERATED_AT = datetime.date(2026, 9, 8)
+GENERATED_AT = datetime.date(2026, 9, 8)  # 火曜日
+
+
+def make_process_master(tmp_path, rows: list[tuple[str, str, int]]) -> ProcessMaster:
+    """(process_code, category, standard_lt_business_days) からテスト用の対応表を作る。"""
+    categories_path = tmp_path / "categories.json"
+    categories_path.write_text(
+        '{"categories": {"その他": {"standard_lt_business_days": 5}}, "unknown_code_category": "その他"}',
+        encoding="utf-8",
+    )
+    master_path = tmp_path / "master.csv"
+    lines = ["process_code,category,note,is_bottleneck,standard_lt_business_days"]
+    for code, category, lt in rows:
+        lines.append(f"{code},{category},,false,{lt}")
+    master_path.write_text("\n".join(lines), encoding="utf-8")
+    return ProcessMaster(categories_path=categories_path, master_csv_path=master_path)
 
 
 def make_order(**overrides) -> OrderRecord:
@@ -132,3 +148,64 @@ def test_feasibility_sorts_most_urgent_first_and_missing_data_last():
     entries = build_feasibility_estimates([ontime_order, unknown_order, late_order], GENERATED_AT, history)
 
     assert [e.order_no for e in entries] == ["PO-LATE", "PO-ONTIME", "PO-UNKNOWN"]
+
+
+def test_capacity_forecast_uses_standard_lt_for_timing_and_shares_for_magnitude(tmp_path):
+    # GENERATED_AT(2026-09-08 火)+3営業日 = 09-09(水),09-10(木),09-11(金) -> 週初め09-07(月)
+    order = make_order(processes=[ProcessStep(2, "TC", "F1", "d1", "d2", "オーダー確定前")])
+    process_master = make_process_master(tmp_path, [("TC", "その他", 3)])
+
+    history = ProcessHistory()
+    history._manhours_by_process["TC"] = [4.0]
+    history._department_counts_by_process["TC"]["DEPT1"] += 1
+    history._by_process["TC"]["M1"] = {"count": 3, "last_used": None}
+    history._by_process["TC"]["M2"] = {"count": 2, "last_used": None}
+
+    by_dept, by_machine = build_capacity_forecast([order], GENERATED_AT, process_master, history)
+
+    week = datetime.date(2026, 9, 7)
+    assert by_dept == [(week, "DEPT1", 4.0)]
+    assert sorted(by_machine) == sorted([(week, "M1", 2.4), (week, "M2", 1.6)])  # シェア0.6/0.4で按分
+
+
+def test_capacity_forecast_walks_multiple_remaining_steps_forward(tmp_path):
+    # 1歩目: 09-08+3営業日=09-11(金,週07-13の週) / 2歩目: さらに+2営業日=09-15(火,週14-20の週)
+    order = make_order(
+        processes=[
+            ProcessStep(2, "TC", "F1", "d1", "d2", "オーダー確定前"),
+            ProcessStep(3, "TD", "F2", "d1", "d2", "オーダー確定前"),
+        ],
+    )
+    process_master = make_process_master(tmp_path, [("TC", "その他", 3), ("TD", "その他", 2)])
+
+    history = ProcessHistory()
+    history._manhours_by_process["TC"] = [4.0]
+    history._department_counts_by_process["TC"]["DEPT1"] += 1
+    history._manhours_by_process["TD"] = [6.0]
+    history._department_counts_by_process["TD"]["DEPT2"] += 1
+
+    by_dept, _ = build_capacity_forecast([order], GENERATED_AT, process_master, history)
+
+    assert (datetime.date(2026, 9, 7), "DEPT1", 4.0) in by_dept
+    assert (datetime.date(2026, 9, 14), "DEPT2", 6.0) in by_dept
+
+
+def test_capacity_forecast_skips_steps_without_manhours_data(tmp_path):
+    order = make_order(processes=[ProcessStep(2, "ZZ", "F1", "d1", "d2", "オーダー確定前")])
+    process_master = make_process_master(tmp_path, [("ZZ", "その他", 3)])
+    history = ProcessHistory()  # 実績データなし
+
+    by_dept, by_machine = build_capacity_forecast([order], GENERATED_AT, process_master, history)
+    assert by_dept == []
+    assert by_machine == []
+
+
+def test_capacity_forecast_excludes_orders_with_no_remaining_steps(tmp_path):
+    order = make_order(processes=[ProcessStep(2, "TC", "F1", "d1", "d2", "作業完了")])  # 全工程完了
+    process_master = make_process_master(tmp_path, [("TC", "その他", 3)])
+    history = ProcessHistory()
+    history._manhours_by_process["TC"] = [4.0]
+    history._department_counts_by_process["TC"]["DEPT1"] += 1
+
+    by_dept, _ = build_capacity_forecast([order], GENERATED_AT, process_master, history)
+    assert by_dept == []

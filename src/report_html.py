@@ -1,7 +1,9 @@
 """オフライン単体HTMLレポート出力。
 
-外部CDN・外部通信は一切使用しない。CSSはインラインで埋め込み、
-工程別仕掛中ランキングの棒グラフはライブラリを使わずSVGで手描きする。
+外部CDN・外部通信は一切使用しない。CSSはインラインで埋め込み、グラフはライブラリを
+使わずSVGで手描きする。--process-data指定時は、週別の折れ線グラフを2つ表示する:
+「週別予測負荷」(これから先、標準LTベースの需要予測)と「週別負荷実績」(過去の振り返り)。
+向きが逆(未来/過去)の別物なので、セクション見出しと注記で明確に区別している。
 """
 from __future__ import annotations
 
@@ -54,17 +56,20 @@ LINE_COLORS = [
 ]
 
 
-def _weekly_load_chart_svg(data: ReportData) -> str:
-    """直近WEEKLY_CHART_WEEKS週分の、部署別 週次実績工数の折れ線グラフ(上位のみ)。
+def _weekly_department_line_chart_svg(
+    points: list[tuple], empty_message: str, aria_label: str, take: str = "last"
+) -> str:
+    """部署別・週次工数の折れ線グラフ(上位のみ)。
 
-    部署数(13種類)が多いため、直近期間内の合計工数が多い上位のみを表示し、
-    全期間・全設備の詳細はExcelの「週別負荷」シートを参照する形にする。
+    部署数(13種類)が多いため、対象期間内の合計工数が多い上位のみを表示する。
+    take="last"は直近WEEKLY_CHART_WEEKS週(実績用)、"first"は今後WEEKLY_CHART_WEEKS週
+    (予測用、予測データは未来の週しか無いため先頭から取る)。
     """
-    points = data.weekly_load_by_department
     if not points:
-        return "<p>工程累積データが指定されていません。</p>"
+        return f"<p>{_esc(empty_message)}</p>"
 
-    weeks = sorted({week for week, _, _ in points})[-WEEKLY_CHART_WEEKS:]
+    all_weeks = sorted({week for week, _, _ in points})
+    weeks = all_weeks[-WEEKLY_CHART_WEEKS:] if take == "last" else all_weeks[:WEEKLY_CHART_WEEKS]
     week_set = set(weeks)
 
     totals: dict[str, float] = {}
@@ -76,7 +81,7 @@ def _weekly_load_chart_svg(data: ReportData) -> str:
 
     top_departments = [d for d, _ in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:WEEKLY_CHART_TOP_DEPARTMENTS]]
     if not top_departments or not weeks:
-        return "<p>直近期間の工程累積データがありません。</p>"
+        return f"<p>{_esc(empty_message)}</p>"
 
     chart_width, chart_height = 640, 260
     margin_left, margin_bottom, margin_top = 40, 30, 10
@@ -121,7 +126,7 @@ def _weekly_load_chart_svg(data: ReportData) -> str:
 
     svg = (
         f'<svg viewBox="0 0 {chart_width} {chart_height}" width="100%" height="{chart_height}" '
-        'role="img" aria-label="週別部署別実績工数">'
+        f'role="img" aria-label="{_esc(aria_label)}">'
         + "".join(y_labels) + "".join(x_labels) + "".join(lines)
         + "</svg>"
     )
@@ -237,9 +242,19 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   </section>
 
   <section>
-    <h2>週別負荷 上位部署(直近{weekly_chart_weeks}週、実績工数)</h2>
+    <h2>週別予測負荷 上位部署(今後{weekly_chart_weeks}週、標準LTベースの需要予測)</h2>
+    {capacity_forecast_chart}
+    <p class="note">
+      ※ 仕掛中の受注の残り工程を、標準LT(営業日、実績日数ではない)で先の週へ積み上げた予測です。
+      工数の大きさ・部署配分は過去実績の按分によります。設備のキャパシティ上限との比較はまだできません
+      (上限データが届き次第、充足率として発展させます)。全部署・全設備の詳細はExcelの「週別予測負荷」シートをご覧ください。
+    </p>
+  </section>
+
+  <section>
+    <h2>週別負荷実績 上位部署(直近{weekly_chart_weeks}週、過去の実績工数)</h2>
     {weekly_load_chart}
-    <p class="note">※ 全部署・全設備・全期間の詳細はExcelの「週別負荷」シートをご覧ください。</p>
+    <p class="note">※ こちらは過去の振り返りです。全部署・全設備・全期間の詳細はExcelの「週別負荷実績」シートをご覧ください。</p>
   </section>
 </body>
 </html>
@@ -272,7 +287,14 @@ def write_html_report(data: ReportData, output_path: Path) -> None:
         congestion_chart=_congestion_bar_chart_svg(data),
         unknown_warning=unknown_warning,
         weekly_chart_weeks=WEEKLY_CHART_WEEKS,
-        weekly_load_chart=_weekly_load_chart_svg(data),
+        weekly_load_chart=_weekly_department_line_chart_svg(
+            data.weekly_load_by_department, "工程累積データが指定されていません。",
+            "週別部署別実績工数", take="last",
+        ),
+        capacity_forecast_chart=_weekly_department_line_chart_svg(
+            data.capacity_forecast_by_department, "工程累積データが指定されていないか、予測対象の仕掛中受注がありません。",
+            "週別部署別予測工数", take="first",
+        ),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

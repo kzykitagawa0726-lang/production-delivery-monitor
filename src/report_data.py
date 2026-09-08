@@ -76,9 +76,13 @@ class ReportData:
     supplier_ranking_by_process: dict[str, list[SupplierSuggestion]] = field(default_factory=dict)
     # 実績ベース納期充足予測(--process-data指定時のみ)。margin_days昇順(危険な順)。
     feasibility_estimates: list[FeasibilityEntry] = field(default_factory=list)
-    # 週別負荷(--process-data指定時のみ)。(週初め, 部署/設備コード, 実績工数合計)のリスト。
+    # 週別負荷・実績(--process-data指定時のみ)。(週初め, 部署/設備コード, 実績工数合計)のリスト。
     weekly_load_by_department: list[tuple[datetime.date, str, float]] = field(default_factory=list)
     weekly_load_by_machine: list[tuple[datetime.date, str, float]] = field(default_factory=list)
+    # 週別予測負荷(--process-data指定時のみ)。仕掛中の残り工程を標準LTで先の週へ積み上げた将来予測。
+    # (週初め, 部署/設備コード, 予測工数合計)のリスト。
+    capacity_forecast_by_department: list[tuple[datetime.date, str, float]] = field(default_factory=list)
+    capacity_forecast_by_machine: list[tuple[datetime.date, str, float]] = field(default_factory=list)
 
 
 def build_report_data(
@@ -140,6 +144,8 @@ def build_report_data(
     feasibility_estimates: list[FeasibilityEntry] = []
     weekly_load_by_department: list[tuple[datetime.date, str, float]] = []
     weekly_load_by_machine: list[tuple[datetime.date, str, float]] = []
+    capacity_forecast_by_department: list[tuple[datetime.date, str, float]] = []
+    capacity_forecast_by_machine: list[tuple[datetime.date, str, float]] = []
     if process_history is not None:
         # ①②(遅延・リスク)の案件についてのみ、現在工程の代替候補設備(社内)を算出する。
         for r in (*delayed, *at_risk):
@@ -150,6 +156,11 @@ def build_report_data(
         feasibility_estimates = build_feasibility_estimates(records, generated_at, process_history)
         weekly_load_by_department = process_history.weekly_load_by_department()
         weekly_load_by_machine = process_history.weekly_load_by_machine()
+
+        if process_master is not None:
+            capacity_forecast_by_department, capacity_forecast_by_machine = build_capacity_forecast(
+                records, generated_at, process_master, process_history
+            )
 
     return ReportData(
         generated_at=generated_at,
@@ -164,6 +175,8 @@ def build_report_data(
         feasibility_estimates=feasibility_estimates,
         weekly_load_by_department=weekly_load_by_department,
         weekly_load_by_machine=weekly_load_by_machine,
+        capacity_forecast_by_department=capacity_forecast_by_department,
+        capacity_forecast_by_machine=capacity_forecast_by_machine,
     )
 
 
@@ -219,3 +232,70 @@ def build_feasibility_estimates(
 
     entries.sort(key=lambda e: (e.margin_days is None, e.margin_days if e.margin_days is not None else 0))
     return entries
+
+
+def _week_start(d: datetime.date) -> datetime.date:
+    return d - datetime.timedelta(days=d.weekday())  # 月曜始まり
+
+
+def _add_business_days(start: datetime.date, business_days: int) -> datetime.date:
+    """土日のみを除いた営業日数を加算する(祝日は考慮しない。原方針どおりシンプルに)。"""
+    d = start
+    remaining = max(business_days, 0)
+    while remaining > 0:
+        d += datetime.timedelta(days=1)
+        if d.weekday() < 5:
+            remaining -= 1
+    return d
+
+
+def build_capacity_forecast(
+    records: list[OrderRecord],
+    generated_at: datetime.date,
+    process_master: ProcessMaster,
+    process_history: ProcessHistory,
+) -> tuple[list[tuple[datetime.date, str, float]], list[tuple[datetime.date, str, float]]]:
+    """仕掛中の全受注について、残り工程が「いつ・どの部署/設備に・どれだけ」の負荷になるかを予測する。
+
+    ②の教訓(実績日数の単純合計は誤差が拡大する)を踏まえ、日程の予測には実績日数ではなく
+    標準LT(config/process_code_master.csv、営業日、変更しない)を使う。工数の大きさと、
+    どの部署・設備が担当するかは過去実績(平均工数・実績シェア)から推定する(kii-san合意:
+    部署単位を主軸としつつ、設備単位も実績シェアで比例配分して算出する)。
+
+    ①②の判定・②の客先納期充足予測とは独立した、追加の参考情報。
+    """
+    department_totals: dict[tuple[datetime.date, str], float] = {}
+    machine_totals: dict[tuple[datetime.date, str], float] = {}
+
+    for r in records:
+        current = r.current_process
+        if current is None:
+            continue
+
+        cursor = generated_at
+        for step in (s for s in r.processes if not s.is_completed):
+            result = process_master.categorize(step.process_code)
+            cursor = _add_business_days(cursor, result.standard_lt_business_days)
+            week = _week_start(cursor)
+
+            hours = process_history.average_manhours_for_process(step.process_code)
+            if not hours:
+                continue
+
+            for dept, share in process_history.department_shares_for_process(step.process_code).items():
+                key = (week, dept)
+                department_totals[key] = department_totals.get(key, 0.0) + hours * share
+
+            for machine, share in process_history.machine_shares_for_process(step.process_code).items():
+                key = (week, machine)
+                machine_totals[key] = machine_totals.get(key, 0.0) + hours * share
+
+    by_department = sorted(
+        ((week, dept, hours) for (week, dept), hours in department_totals.items()),
+        key=lambda t: (t[0], t[1]),
+    )
+    by_machine = sorted(
+        ((week, machine, hours) for (week, machine), hours in machine_totals.items()),
+        key=lambda t: (t[0], t[1]),
+    )
+    return by_department, by_machine

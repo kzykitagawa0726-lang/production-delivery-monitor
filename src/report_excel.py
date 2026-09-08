@@ -1,4 +1,4 @@
-"""Excel(5〜6シート)レポート出力。
+"""Excel(5〜11シート)レポート出力。
 
 シート構成:
   1. メインサマリー
@@ -9,11 +9,13 @@
      --process-data指定時は「参考実績LT(暦日)」列も追加。標準LT(営業日)は変更しない)
   6. 工程別仕入先実績ランキング(--supplier-data指定時のみ。仕入累積データから
      工程コード別に実績の多い仕入先を集計)
-  7. 実績ベース納期充足予測(--process-data指定時のみ。進行中の受注について、
-     残り工程の実績LTを積み上げた予測完了日と顧客納期を比較する。①②の判定
-     [自社納期・残日ベース]とは独立した参考情報)
-  8. 週別負荷(部署別)(--process-data指定時のみ。週×部署コードの実績工数ピボット)
-  9. 週別負荷(設備別)(--process-data指定時のみ。週別・設備別の実績工数一覧)
+  7. 実績ベース納期充足予測(--process-data指定時のみ。図番単位の「受注〜完成」実績日数から
+     予測完了日を算出し、顧客納期と比較する。①②の判定[自社納期・残日ベース]とは独立した参考情報)
+  8. 週別負荷実績(部署別)/9. 週別負荷実績(設備別)(--process-data指定時のみ。
+     過去の実績工数を週別に集計した「振り返り」)
+  10. 週別予測負荷(部署別)/11. 週別予測負荷(設備別)(--process-data指定時のみ。
+     仕掛中の受注の残り工程を標準LTで先の週へ積み上げた「これから」の需要予測。
+     8・9とは向き[過去/未来]が異なる別物なので混同しないよう注意)
 
 ①②リストには「代替候補(社内設備／外注仕入先)」列を追加する
 (--process-data / --supplier-data のどちらか、または両方を指定した場合のみ値が入る)。
@@ -149,9 +151,23 @@ def write_excel_report(
     if data.feasibility_estimates:
         _write_feasibility_sheet(wb.create_sheet("実績ベース納期充足予測"), data)
     if data.weekly_load_by_department:
-        _write_weekly_load_department_sheet(wb.create_sheet("週別負荷(部署別)"), data)
+        _write_weekly_department_pivot_sheet(
+            wb.create_sheet("週別負荷実績(部署別)"), data.weekly_load_by_department, "実績工数合計"
+        )
     if data.weekly_load_by_machine:
-        _write_weekly_load_machine_sheet(wb.create_sheet("週別負荷(設備別)"), data)
+        _write_weekly_machine_list_sheet(
+            wb.create_sheet("週別負荷実績(設備別)"), data.weekly_load_by_machine, "実績工数合計"
+        )
+    if data.capacity_forecast_by_department:
+        _write_weekly_department_pivot_sheet(
+            wb.create_sheet("週別予測負荷(部署別)"), data.capacity_forecast_by_department, "予測工数合計"
+        )
+        _write_capacity_forecast_note(wb["週別予測負荷(部署別)"])
+    if data.capacity_forecast_by_machine:
+        _write_weekly_machine_list_sheet(
+            wb.create_sheet("週別予測負荷(設備別)"), data.capacity_forecast_by_machine, "予測工数合計"
+        )
+        _write_capacity_forecast_note(wb["週別予測負荷(設備別)"])
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -307,15 +323,18 @@ def _write_feasibility_sheet(ws: Worksheet, data: ReportData) -> None:
     ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
 
 
-def _write_weekly_load_department_sheet(ws: Worksheet, data: ReportData) -> None:
-    """週別・部署別の実績工数(週を行、部署コードを列とするピボット表)。
+def _write_weekly_department_pivot_sheet(
+    ws: Worksheet, points: list[tuple[datetime.date, str, float]], value_header: str
+) -> None:
+    """週×部署コードのピボット表(週を行、部署コードを列とする)。
 
     「加工先」列(数値・13種類)を部署/コストセンターコードとして扱う(kii-san確認)。
-    週は完成日が属する月曜始まりの週(MVP。着手〜完成にまたがる稼働の日別按分はしていない)。
+    実績シートでは週は完成日が属する月曜始まりの週、予測シートでは標準LTを積み上げた予測日が
+    属する週(いずれもMVP。日別按分はしていない)。
     """
-    departments = sorted({dept for _, dept, _ in data.weekly_load_by_department})
-    weeks = sorted({week for week, _, _ in data.weekly_load_by_department})
-    grid: dict[tuple, float] = {(week, dept): hours for week, dept, hours in data.weekly_load_by_department}
+    departments = sorted({dept for _, dept, _ in points})
+    weeks = sorted({week for week, _, _ in points})
+    grid: dict[tuple, float] = {(week, dept): hours for week, dept, hours in points}
 
     headers = ["週(月曜始まり)", *departments, "合計"]
     _write_header_row(ws, headers)
@@ -331,13 +350,33 @@ def _write_weekly_load_department_sheet(ws: Worksheet, data: ReportData) -> None
     ws.freeze_panes = "B2"
 
 
-def _write_weekly_load_machine_sheet(ws: Worksheet, data: ReportData) -> None:
-    """週別・設備別の実績工数(設備数が多いため縦持ちの一覧形式。週降順→工数降順)。"""
-    headers = ["週(月曜始まり)", "設備コード", "実績工数合計"]
+def _write_weekly_machine_list_sheet(
+    ws: Worksheet, points: list[tuple[datetime.date, str, float]], value_header: str
+) -> None:
+    """週×設備コードの一覧(設備数が多いため縦持ち形式。週昇順→工数降順)。"""
+    headers = ["週(月曜始まり)", "設備コード", value_header]
     _write_header_row(ws, headers)
-    rows = sorted(data.weekly_load_by_machine, key=lambda t: (t[0], -t[2]))
+    rows = sorted(points, key=lambda t: (t[0], -t[2]))
     for r_idx, row in enumerate(rows, start=2):
         for c_idx, value in enumerate(row, start=1):
             ws.cell(row=r_idx, column=c_idx, value=value)
     _autosize_columns(ws, headers, rows)
     ws.freeze_panes = "A2"
+
+
+def _write_capacity_forecast_note(ws: Worksheet) -> None:
+    """週別予測負荷シートの下に、算出方法と限界を明記する注記を付ける。"""
+    note_row = ws.max_row + 2
+    ws.cell(
+        row=note_row, column=1,
+        value=(
+            "※ これは仕掛中の受注の「残り工程」を、標準LT(config/process_code_master.csv、"
+            "営業日、実績日数ではない)で先の週へ積み上げた将来の予測需要です。工数の大きさは"
+            "工程コードごとの過去の平均実績工数、部署・設備への配分は過去の実績シェアに基づく"
+            "按分(比例配分)です。設備への配分は、将来どの設備が空いているかまでは予測できないため、"
+            "過去の使用実績の比率で仮に割り振った参考値です。"
+            "設備別のキャパシティ上限(1日あたり稼働可能時間など)が分かれば、この予測工数と比較して"
+            "充足率を出せます。"
+        ),
+    )
+    ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")

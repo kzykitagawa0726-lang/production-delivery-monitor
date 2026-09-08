@@ -44,7 +44,7 @@ from __future__ import annotations
 import datetime
 import json
 import statistics
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -56,7 +56,7 @@ from src.process_master import normalize_process_code
 DEFAULT_CACHE_PATH = Path(".cache/process_history.json")
 # 集計ロジックを変更したら上げる。ソースファイルが同じでもキャッシュを無効化し、
 # 古いロジックで集計された結果を誤って使い続けないようにするためのガード。
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 6
 
 IDX_ORDER_NO = 0
 IDX_LINE = 1  # 行(受注№と組み合わせて1つの工程ルート=インスタンスを識別)
@@ -154,6 +154,12 @@ class ProcessHistory:
         self._order_level_durations_by_drawing: dict[str, list[int]] = defaultdict(list)
         # _ingest_file中の一時集計。全ファイル読み込み後にfinalizeして上記に変換し、破棄する。
         self._instance_bounds: dict[tuple[str, str], dict] = {}
+        # department_counts_by_process[工程コード] = Counter(部署コード)(将来予測負荷で、工程コードの
+        # 実績部署シェアを算出するために使う。設備別は既存のby_process[工程コード][設備]のcountを流用する)
+        self._department_counts_by_process: dict[str, Counter[str]] = defaultdict(Counter)
+        # manhours_by_process[工程コード] = [実績工数, ...](将来予測負荷で、工程1件あたりの
+        # 典型的な工数を推定するために使う。平均を採用)
+        self._manhours_by_process: dict[str, list[float]] = defaultdict(list)
 
     @classmethod
     def load(cls, paths: list[Path], cache_path: Path = DEFAULT_CACHE_PATH) -> "ProcessHistory":
@@ -212,14 +218,20 @@ class ProcessHistory:
                     self._seq_by_drawing_process[(drawing_no, process_code)].append(int(seq))
                 self._drawing_process_codes[drawing_no].add(process_code)
 
-            if complete_date:
+            manhours = row[IDX_ACTUAL_MANHOURS]
+            has_manhours = isinstance(manhours, (int, float)) and manhours > 0
+
+            if complete_date and has_manhours:
                 week = _week_start(complete_date)
-                manhours = row[IDX_ACTUAL_MANHOURS]
-                if isinstance(manhours, (int, float)) and manhours > 0:
-                    if department:
-                        self._weekly_load_by_department[(week, department)] += manhours
-                    if machine:
-                        self._weekly_load_by_machine[(week, machine)] += manhours
+                if department:
+                    self._weekly_load_by_department[(week, department)] += manhours
+                if machine:
+                    self._weekly_load_by_machine[(week, machine)] += manhours
+
+            if department:
+                self._department_counts_by_process[process_code][department] += 1
+            if has_manhours:
+                self._manhours_by_process[process_code].append(manhours)
 
             order_no = str(row[IDX_ORDER_NO]).strip() if row[IDX_ORDER_NO] not in (None, "") else None
             line = str(row[IDX_LINE]).strip() if row[IDX_LINE] not in (None, "") else None
@@ -391,6 +403,39 @@ class ProcessHistory:
             key=lambda t: (t[0], t[1]),
         )
 
+    # --- 将来予測負荷(report_data.build_capacity_forecastが使用) ---
+
+    def average_manhours_for_process(self, process_code: str) -> Optional[float]:
+        """工程コード1件あたりの典型的な実績工数(平均)。予測負荷の「大きさ」に使う。"""
+        values = self._manhours_by_process.get(normalize_process_code(process_code))
+        if not values:
+            return None
+        return statistics.mean(values)
+
+    def department_shares_for_process(self, process_code: str) -> dict[str, float]:
+        """工程コードの部署別シェア(実績件数比率、合計1.0)。理想は設備別だが(kii-san指摘)、
+        設備は146種と多く1つの工程コードが多数の設備に分散するため、まず部署単位(13種)を主軸にする。
+        """
+        counts = self._department_counts_by_process.get(normalize_process_code(process_code))
+        if not counts:
+            return {}
+        total = sum(counts.values())
+        return {dept: n / total for dept, n in counts.items()}
+
+    def machine_shares_for_process(self, process_code: str) -> dict[str, float]:
+        """工程コードの設備別シェア(実績件数比率、合計1.0)。kii-san要望の設備単位の予測に使う。
+
+        将来どの設備が空くかは予測できないため、過去の実績シェアに比例して配分する
+        近似(1台に決め打ちしない)。
+        """
+        entries = self._by_process.get(normalize_process_code(process_code))
+        if not entries:
+            return {}
+        total = sum(d["count"] for d in entries.values())
+        if total == 0:
+            return {}
+        return {machine: d["count"] / total for machine, d in entries.items()}
+
     # --- キャッシュ ---
 
     def to_cache_dict(self) -> dict:
@@ -427,6 +472,10 @@ class ProcessHistory:
                 for (week, machine), hours in self._weekly_load_by_machine.items()
             },
             "order_level_durations_by_drawing": dict(self._order_level_durations_by_drawing),
+            "department_counts_by_process": {
+                code: dict(counts) for code, counts in self._department_counts_by_process.items()
+            },
+            "manhours_by_process": dict(self._manhours_by_process),
         }
 
     @classmethod
@@ -461,6 +510,10 @@ class ProcessHistory:
             history._weekly_load_by_machine[(datetime.date.fromisoformat(week_iso), machine)] = hours
         for drawing, durations in payload.get("order_level_durations_by_drawing", {}).items():
             history._order_level_durations_by_drawing[drawing] = list(durations)
+        for code, counts in payload.get("department_counts_by_process", {}).items():
+            history._department_counts_by_process[code] = Counter(counts)
+        for code, values in payload.get("manhours_by_process", {}).items():
+            history._manhours_by_process[code] = list(values)
         return history
 
 

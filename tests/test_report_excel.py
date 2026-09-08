@@ -61,6 +61,10 @@ def test_write_excel_report_adds_process_history_sheets(tmp_path):
     process_history._order_level_durations_by_drawing["312127272601"] = [10]
     process_history._weekly_load_by_department[(datetime.date(2026, 8, 31), "1223")] = 12.5
     process_history._weekly_load_by_machine[(datetime.date(2026, 8, 31), "F1")] = 12.5
+    # 将来予測負荷(HBは対応表で熱処理系・標準LT10営業日)
+    process_history._manhours_by_process["HB"] = [3.0]
+    process_history._department_counts_by_process["HB"]["1223"] += 1
+    process_history._by_process["HB"]["F1"] = {"count": 1, "last_used": None}
 
     output_path = tmp_path / "report.xlsx"
     write_excel_report(
@@ -70,8 +74,12 @@ def test_write_excel_report_adds_process_history_sheets(tmp_path):
 
     wb = load_workbook(output_path)
     assert "実績ベース納期充足予測" in wb.sheetnames
-    assert "週別負荷(部署別)" in wb.sheetnames
-    assert "週別負荷(設備別)" in wb.sheetnames
+    assert "週別負荷実績(部署別)" in wb.sheetnames
+    assert "週別負荷実績(設備別)" in wb.sheetnames
+    assert "週別予測負荷(部署別)" in wb.sheetnames
+    assert "週別予測負荷(設備別)" in wb.sheetnames
     assert wb["実績ベース納期充足予測"]["A2"].value == "ORD-RISK"
-    assert wb["週別負荷(部署別)"]["B2"].value == 12.5
-    assert wb["週別負荷(設備別)"]["C2"].value == 12.5
+    assert wb["週別負荷実績(部署別)"]["B2"].value == 12.5
+    assert wb["週別負荷実績(設備別)"]["C2"].value == 12.5
+    assert wb["週別予測負荷(部署別)"]["B2"].value == 3.0
+    assert wb["週別予測負荷(設備別)"]["C2"].value == 3.0
