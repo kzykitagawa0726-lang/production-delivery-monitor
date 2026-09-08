@@ -16,6 +16,7 @@ class CongestionEntry:
     count: int
     is_bottleneck: bool
     is_unknown_code: bool
+    standard_lt_business_days: int
 
 
 @dataclass
@@ -63,6 +64,7 @@ def build_report_data(
                     count=count,
                     is_bottleneck=result.is_bottleneck,
                     is_unknown_code=result.is_unknown_code,
+                    standard_lt_business_days=result.standard_lt_business_days,
                 )
             )
 

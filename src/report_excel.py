@@ -180,19 +180,20 @@ def _write_list_sheet(ws: Worksheet, headers: list[str], rows: list[tuple], high
 
 
 def _write_congestion_sheet(ws: Worksheet, data: ReportData) -> None:
-    headers = ["工程コード", "カテゴリ", "仕掛中件数", "ボトルネック", "未分類"]
+    headers = ["工程コード", "カテゴリ", "仕掛中件数", "標準LT(営業日)", "ボトルネック", "未分類"]
     _write_header_row(ws, headers)
     for r_idx, entry in enumerate(data.congestion_ranking, start=2):
         ws.cell(row=r_idx, column=1, value=entry.process_code)
         ws.cell(row=r_idx, column=2, value=entry.category)
         ws.cell(row=r_idx, column=3, value=entry.count)
-        ws.cell(row=r_idx, column=4, value="★ボトルネック" if entry.is_bottleneck else "")
-        ws.cell(row=r_idx, column=5, value="⚠未分類" if entry.is_unknown_code else "")
+        ws.cell(row=r_idx, column=4, value=entry.standard_lt_business_days)
+        ws.cell(row=r_idx, column=5, value="★ボトルネック" if entry.is_bottleneck else "")
+        ws.cell(row=r_idx, column=6, value="⚠未分類" if entry.is_unknown_code else "")
         if entry.is_bottleneck:
-            for c in range(1, 6):
+            for c in range(1, 7):
                 ws.cell(row=r_idx, column=c).fill = BOTTLENECK_FILL
     rows = [
-        (e.process_code, e.category, e.count, e.is_bottleneck, e.is_unknown_code)
+        (e.process_code, e.category, e.count, e.standard_lt_business_days, e.is_bottleneck, e.is_unknown_code)
         for e in data.congestion_ranking
     ]
     _autosize_columns(ws, headers, rows)

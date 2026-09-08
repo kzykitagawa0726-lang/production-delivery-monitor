@@ -4,10 +4,13 @@
 プログラム内に埋め込まず、config/process_code_master.csv と
 config/process_categories.json に分離している(kii-san要件)。
 
-工程コード対応表(PDF由来)が届くまでは、実データの工程コードは全て
-config/process_code_master.csv 上のサンプル行にしか一致しないため、
-すべて「その他」(未知コード)として扱われる。未知コードは一覧にまとめ、
-レポート上で警告表示する。
+2026-09-08、kii-sanより実際の工程コード対応表(218件、コード別LT付き)を
+提供いただいたため、config/process_code_master.csv に反映済み。
+カテゴリ(熱処理系/歯切り系/研磨系/検査/その他)とボトルネック区分
+(ウォーム・スプライン・歯研系)は、対応表に列がなかったため工程名詳細の
+キーワードから自動推定した一次案。LT(標準リードタイム)は対応表記載の
+コード別の値をそのまま使用する(カテゴリ単位の固定値は、CSV側にLTが
+無い将来の未知コード用のフォールバックとしてのみ残す)。
 """
 from __future__ import annotations
 
@@ -41,13 +44,15 @@ class ProcessMaster:
         }
         self._unknown_category = categories_config["unknown_code_category"]
 
-        self._code_map: dict[str, tuple[str, bool]] = {}
+        self._code_map: dict[str, tuple[str, bool, int | None]] = {}
         with open(master_csv_path, encoding="utf-8", newline="") as f:
             for row in csv.DictReader(_skip_comments(f)):
                 code = row["process_code"].strip()
                 category = row["category"].strip()
                 is_bottleneck = row["is_bottleneck"].strip().lower() == "true"
-                self._code_map[code] = (category, is_bottleneck)
+                raw_lt = (row.get("standard_lt_business_days") or "").strip()
+                lt = int(raw_lt) if raw_lt else None  # 未記入の場合はカテゴリ既定値にフォールバック
+                self._code_map[code] = (category, is_bottleneck, lt)
 
         self._unknown_codes: set[str] = set()
 
@@ -58,11 +63,12 @@ class ProcessMaster:
             category = self._unknown_category
             is_bottleneck = False
             is_unknown = True
+            lt = None
         else:
-            category, is_bottleneck = entry
+            category, is_bottleneck, lt = entry
             is_unknown = False
 
-        standard_lt = self._categories.get(category, self._categories[self._unknown_category])
+        standard_lt = lt if lt is not None else self._categories.get(category, self._categories[self._unknown_category])
         return CategoryResult(
             category=category,
             standard_lt_business_days=standard_lt,
