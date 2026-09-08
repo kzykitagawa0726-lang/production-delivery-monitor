@@ -80,11 +80,11 @@ class OrderRecord:
     processes: list[ProcessStep] = field(default_factory=list)  # スロット2〜20
 
     # 仕入(外注)累積データ(--supplier-data)が渡された場合のみ設定される代替候補仕入先。
-    # 現在工程(current_process)について、図番一致→工程コード一致の優先順で算出する。
+    # 現在工程(current_process)について、図番+工程コード一致→工程コードのみ一致の優先順で算出する。
     supplier_suggestions: list = field(default_factory=list)  # list[SupplierSuggestion]
 
     # 工程累積データ(--process-data)が渡された場合のみ設定される代替候補設備(社内)。
-    # 算出ロジックはsupplier_suggestionsと同様(図番一致優先)。
+    # 算出ロジックはsupplier_suggestionsと同様(図番+工程コード一致優先)。
     machine_suggestions: list = field(default_factory=list)  # list[MachineSuggestion]
 
     judgement: Optional[Judgement] = None

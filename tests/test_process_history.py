@@ -39,28 +39,31 @@ def make_workbook(rows: list[tuple], path):
     wb.save(path)
 
 
-def test_load_aggregates_by_drawing_and_process(tmp_path):
+def test_suggest_requires_drawing_and_process_code_to_both_match(tmp_path):
+    # 図番だけの一致では、別の工程を担当しただけの設備が紛れ込んでしまうため、
+    # 図番+工程コードの組み合わせで一致した実績のみを返す(kii-san指摘: 2026-09-08)。
     path = tmp_path / "process2023.xlsx"
     make_workbook(
         [
             _row(machine="KW451", drawing="DWG-A1", process="HB", start=20230101, complete=20230105),
             _row(machine="KW451", drawing="DWG-A1", process="HB", start=20230201, complete=20230210),
-            _row(machine="KB400", drawing="DWG-A1", process="MC", start=20230101, complete=20230103),
+            _row(machine="KB400", drawing="DWG-A1", process="MC", start=20230101, complete=20230103),  # 同じ図番だが別工程
         ],
         path,
     )
 
     history = ProcessHistory.load([path], cache_path=tmp_path / "cache.json")
 
-    # 図番一致は工程コードを問わず集計する(KW451:HB×2件, KB400:MC×1件)。件数順。
     suggestions = history.suggest_machines("DWG-A1", "HB")
-    assert len(suggestions) == 2
+    assert len(suggestions) == 1
     assert suggestions[0].machine_code == "KW451"
-    assert suggestions[0].match_type == "drawing"
+    assert suggestions[0].match_type == "drawing_process"
     assert suggestions[0].count == 2
     assert suggestions[0].last_used == datetime.date(2023, 2, 10)
-    assert suggestions[1].machine_code == "KB400"
-    assert suggestions[1].count == 1
+
+    mc_suggestions = history.suggest_machines("DWG-A1", "MC")
+    assert len(mc_suggestions) == 1
+    assert mc_suggestions[0].machine_code == "KB400"
 
 
 def test_suggest_falls_back_to_process_code_when_drawing_unknown():

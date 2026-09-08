@@ -1,4 +1,4 @@
-"""工程累積データ(社内実績)から、図番・工程コードごとの設備実績を集計する。
+"""工程累積データ(社内実績)から、図番×工程コードごとの設備実績を集計する。
 
 kii-san提供の複数年分の工程実績Excel(基幹システムからのエクスポート、
 1行=1受注の1工程ステップ、内外作区分は全行1=社内、作業完了は全行1=完了済み)
@@ -6,7 +6,9 @@ kii-san提供の複数年分の工程実績Excel(基幹システムからのエ�
 対し、こちらは社内設備の代替候補提示と、実績リードタイムの参考表示を担当する
 (2026-09-08 設計合意)。
 
-- 図番での紐付けが最優先(実データで週次受注データの図番と69.9%一致することを確認済み)。
+- 図番と工程コードの組み合わせが紐付けの最優先(kii-san指摘: 2026-09-08。
+  図番だけで一致させると、その図番の別の工程を担当しただけの設備まで
+  「代替候補」として出てしまい、実態と異なる提案になるため)。
   一致がなければ工程コード単位の一般的な実績にフォールバックする。
 - 「予定機械」列が週次WIPデータの「加工先」と94%一致することを確認済みのため、
   設備の識別子としてこの列を使う(「加工先」列は数値の部門/得意先寄りのコードで別物)。
@@ -34,7 +36,7 @@ from src.process_master import normalize_process_code
 DEFAULT_CACHE_PATH = Path(".cache/process_history.json")
 # 集計ロジックを変更したら上げる。ソースファイルが同じでもキャッシュを無効化し、
 # 古いロジックで集計された結果を誤って使い続けないようにするためのガード。
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 IDX_ORDER_NO = 0
 IDX_PROC_SEQ = 2
@@ -49,13 +51,13 @@ IDX_ACTUAL_COMPLETE = 92  # 完成日
 class MachineSuggestion:
     machine_code: str
     process_code: Optional[str]
-    match_type: str  # "drawing"(図番一致) or "process_code"(工程コード一致)
+    match_type: str  # "drawing_process"(図番+工程一致) or "process_code"(工程コードのみ一致)
     count: int
     last_used: Optional[datetime.date]
 
     @property
     def label(self) -> str:
-        kind = "図番一致" if self.match_type == "drawing" else "工程一致"
+        kind = "図番+工程一致" if self.match_type == "drawing_process" else "工程一致"
         last = self.last_used.isoformat() if self.last_used else "不明"
         return f"設備{self.machine_code}(社内, {kind} {self.count}回, 最終{last})"
 
@@ -74,8 +76,8 @@ def _parse_date(value) -> Optional[datetime.date]:
 
 class ProcessHistory:
     def __init__(self) -> None:
-        # by_drawing[図番][設備コード] = {"count": int, "last_used": date|None}
-        self._by_drawing: dict[str, dict[str, dict]] = defaultdict(lambda: defaultdict(
+        # by_drawing_process[(図番, 工程コード)][設備コード] = {"count": int, "last_used": date|None}
+        self._by_drawing_process: dict[tuple[str, str], dict[str, dict]] = defaultdict(lambda: defaultdict(
             lambda: {"count": 0, "last_used": None}
         ))
         # by_process[工程コード][設備コード] = {"count": int, "last_used": date|None}
@@ -122,10 +124,10 @@ class ProcessHistory:
                 proc_entry["last_used"] = complete_date
 
             if drawing_no:
-                dwg_entry = self._by_drawing[drawing_no][machine]
-                dwg_entry["count"] += 1
-                if complete_date and (dwg_entry["last_used"] is None or complete_date > dwg_entry["last_used"]):
-                    dwg_entry["last_used"] = complete_date
+                dp_entry = self._by_drawing_process[(drawing_no, process_code)][machine]
+                dp_entry["count"] += 1
+                if complete_date and (dp_entry["last_used"] is None or complete_date > dp_entry["last_used"]):
+                    dp_entry["last_used"] = complete_date
 
             start_date = _parse_date(row[IDX_START])
             if start_date and complete_date:
@@ -136,29 +138,33 @@ class ProcessHistory:
     def suggest_machines(
         self, drawing_no: Optional[str], process_code: Optional[str], top_n: int = 3
     ) -> list[MachineSuggestion]:
-        if drawing_no and drawing_no in self._by_drawing:
-            entries = self._by_drawing[drawing_no]
-            ranked = sorted(entries.items(), key=lambda kv: kv[1]["count"], reverse=True)[:top_n]
-            return [
-                MachineSuggestion(
-                    machine_code=machine, process_code=process_code,
-                    match_type="drawing", count=data["count"], last_used=data["last_used"],
-                )
-                for machine, data in ranked
-            ]
+        if not process_code:
+            return []
+        normalized = normalize_process_code(process_code)
 
-        if process_code:
-            normalized = normalize_process_code(process_code)
-            if normalized in self._by_process:
-                entries = self._by_process[normalized]
+        if drawing_no:
+            key = (drawing_no, normalized)
+            if key in self._by_drawing_process:
+                entries = self._by_drawing_process[key]
                 ranked = sorted(entries.items(), key=lambda kv: kv[1]["count"], reverse=True)[:top_n]
                 return [
                     MachineSuggestion(
                         machine_code=machine, process_code=normalized,
-                        match_type="process_code", count=data["count"], last_used=data["last_used"],
+                        match_type="drawing_process", count=data["count"], last_used=data["last_used"],
                     )
                     for machine, data in ranked
                 ]
+
+        if normalized in self._by_process:
+            entries = self._by_process[normalized]
+            ranked = sorted(entries.items(), key=lambda kv: kv[1]["count"], reverse=True)[:top_n]
+            return [
+                MachineSuggestion(
+                    machine_code=machine, process_code=normalized,
+                    match_type="process_code", count=data["count"], last_used=data["last_used"],
+                )
+                for machine, data in ranked
+            ]
 
         return []
 
@@ -171,12 +177,12 @@ class ProcessHistory:
 
     def to_cache_dict(self) -> dict:
         return {
-            "by_drawing": {
-                drawing: {
+            "by_drawing_process": {
+                f"{drawing}\x1f{code}": {
                     machine: {"count": d["count"], "last_used": d["last_used"].isoformat() if d["last_used"] else None}
                     for machine, d in machines.items()
                 }
-                for drawing, machines in self._by_drawing.items()
+                for (drawing, code), machines in self._by_drawing_process.items()
             },
             "by_process": {
                 code: {
@@ -191,9 +197,10 @@ class ProcessHistory:
     @classmethod
     def from_cache_dict(cls, payload: dict) -> "ProcessHistory":
         history = cls()
-        for drawing, machines in payload["by_drawing"].items():
+        for key, machines in payload["by_drawing_process"].items():
+            drawing, code = key.split("\x1f", 1)
             for machine, d in machines.items():
-                entry = history._by_drawing[drawing][machine]
+                entry = history._by_drawing_process[(drawing, code)][machine]
                 entry["count"] = d["count"]
                 entry["last_used"] = datetime.date.fromisoformat(d["last_used"]) if d["last_used"] else None
         for code, machines in payload["by_process"].items():

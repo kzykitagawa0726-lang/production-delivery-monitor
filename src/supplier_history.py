@@ -1,10 +1,12 @@
-"""仕入(外注)累積データから、図番・工程コードごとの仕入先実績を集計する。
+"""仕入(外注)累積データから、図番×工程コードごとの仕入先実績を集計する。
 
 kii-san提供の複数年分の仕入データExcel(基幹システムからのエクスポート)を
-読み込み、「この図番/工程コードなら過去にどの仕入先が対応してきたか」を
+読み込み、「この図番のこの工程なら過去にどの仕入先が対応してきたか」を
 集計する。①②で停滞している工程の「代替先候補」提示に使う(2026-09-08 設計合意)。
 
-- 図番での紐付けが最優先(実データで78.2%が週次受注データの図番と一致することを確認済み)。
+- 図番と工程コードの組み合わせが紐付けの最優先(kii-san指摘: 2026-09-08。
+  図番だけで一致させると、その図番の別の工程を担当しただけの仕入先まで
+  「代替候補」として出てしまい、実態と異なる提案になるため)。
   一致がなければ工程コード単位の一般的な実績にフォールバックする。
 - 仕入単価・金額はセンシティブな財務情報のため、集計結果には一切含めない
   (件数・最終利用日のみ)。
@@ -17,7 +19,7 @@ from __future__ import annotations
 
 import datetime
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -29,7 +31,7 @@ from src.process_master import normalize_process_code
 DEFAULT_CACHE_PATH = Path(".cache/supplier_history.json")
 # 集計ロジックを変更したら上げる。ソースファイルが同じでもキャッシュを無効化し、
 # 古いロジックで集計された結果を誤って使い続けないようにするためのガード。
-CACHE_SCHEMA_VERSION = 1
+CACHE_SCHEMA_VERSION = 2
 
 # 2022年のみ列数が少ない簡易フォーマット。2023年以降は55列共通フォーマット。
 HEADER_19 = [
@@ -51,14 +53,14 @@ HEADER_55 = [
 @dataclass
 class SupplierSuggestion:
     supplier_code: str
-    process_code: Optional[str]  # 図番一致の場合、最頻の工程コード。工程コード一致の場合はクエリと同じ
-    match_type: str  # "drawing"(図番一致) or "process_code"(工程コード一致)
+    process_code: Optional[str]
+    match_type: str  # "drawing_process"(図番+工程一致) or "process_code"(工程コードのみ一致)
     count: int
     last_used: Optional[datetime.date]
 
     @property
     def label(self) -> str:
-        kind = "図番一致" if self.match_type == "drawing" else "工程一致"
+        kind = "図番+工程一致" if self.match_type == "drawing_process" else "工程一致"
         last = self.last_used.isoformat() if self.last_used else "不明"
         return f"仕入先{self.supplier_code}({kind} {self.count}回, 最終{last})"
 
@@ -86,9 +88,9 @@ def _iter_rows(path: Path):
 
 class SupplierHistory:
     def __init__(self) -> None:
-        # by_drawing[図番][仕入先CD] = {"count": int, "last_used": date|None, "process_codes": Counter}
-        self._by_drawing: dict[str, dict[str, dict]] = defaultdict(lambda: defaultdict(
-            lambda: {"count": 0, "last_used": None, "process_codes": Counter()}
+        # by_drawing_process[(図番, 工程コード)][仕入先CD] = {"count": int, "last_used": date|None}
+        self._by_drawing_process: dict[tuple[str, str], dict[str, dict]] = defaultdict(lambda: defaultdict(
+            lambda: {"count": 0, "last_used": None}
         ))
         # by_process[工程コード][仕入先CD] = {"count": int, "last_used": date|None}
         self._by_process: dict[str, dict[str, dict]] = defaultdict(lambda: defaultdict(
@@ -131,57 +133,53 @@ class SupplierHistory:
                 proc_entry["last_used"] = date
 
             if drawing_no:
-                dwg_entry = self._by_drawing[drawing_no][supplier_code]
-                dwg_entry["count"] += 1
-                dwg_entry["process_codes"][process_code] += 1
-                if date and (dwg_entry["last_used"] is None or date > dwg_entry["last_used"]):
-                    dwg_entry["last_used"] = date
+                dp_entry = self._by_drawing_process[(drawing_no, process_code)][supplier_code]
+                dp_entry["count"] += 1
+                if date and (dp_entry["last_used"] is None or date > dp_entry["last_used"]):
+                    dp_entry["last_used"] = date
 
     def suggest(self, drawing_no: Optional[str], process_code: Optional[str], top_n: int = 3) -> list[SupplierSuggestion]:
-        if drawing_no and drawing_no in self._by_drawing:
-            entries = self._by_drawing[drawing_no]
-            ranked = sorted(entries.items(), key=lambda kv: kv[1]["count"], reverse=True)[:top_n]
-            return [
-                SupplierSuggestion(
-                    supplier_code=supplier,
-                    process_code=data["process_codes"].most_common(1)[0][0] if data["process_codes"] else None,
-                    match_type="drawing",
-                    count=data["count"],
-                    last_used=data["last_used"],
-                )
-                for supplier, data in ranked
-            ]
+        if not process_code:
+            return []
+        normalized = normalize_process_code(process_code)
 
-        if process_code:
-            normalized = normalize_process_code(process_code)
-            if normalized in self._by_process:
-                entries = self._by_process[normalized]
+        if drawing_no:
+            key = (drawing_no, normalized)
+            if key in self._by_drawing_process:
+                entries = self._by_drawing_process[key]
                 ranked = sorted(entries.items(), key=lambda kv: kv[1]["count"], reverse=True)[:top_n]
                 return [
                     SupplierSuggestion(
-                        supplier_code=supplier,
-                        process_code=normalized,
-                        match_type="process_code",
-                        count=data["count"],
-                        last_used=data["last_used"],
+                        supplier_code=supplier, process_code=normalized,
+                        match_type="drawing_process", count=data["count"], last_used=data["last_used"],
                     )
                     for supplier, data in ranked
                 ]
+
+        if normalized in self._by_process:
+            entries = self._by_process[normalized]
+            ranked = sorted(entries.items(), key=lambda kv: kv[1]["count"], reverse=True)[:top_n]
+            return [
+                SupplierSuggestion(
+                    supplier_code=supplier, process_code=normalized,
+                    match_type="process_code", count=data["count"], last_used=data["last_used"],
+                )
+                for supplier, data in ranked
+            ]
 
         return []
 
     def to_cache_dict(self) -> dict:
         return {
-            "by_drawing": {
-                drawing: {
+            "by_drawing_process": {
+                f"{drawing}\x1f{code}": {
                     supplier: {
                         "count": data["count"],
                         "last_used": data["last_used"].isoformat() if data["last_used"] else None,
-                        "process_codes": dict(data["process_codes"]),
                     }
                     for supplier, data in suppliers.items()
                 }
-                for drawing, suppliers in self._by_drawing.items()
+                for (drawing, code), suppliers in self._by_drawing_process.items()
             },
             "by_process": {
                 code: {
@@ -198,12 +196,12 @@ class SupplierHistory:
     @classmethod
     def from_cache_dict(cls, payload: dict) -> "SupplierHistory":
         history = cls()
-        for drawing, suppliers in payload["by_drawing"].items():
+        for key, suppliers in payload["by_drawing_process"].items():
+            drawing, code = key.split("\x1f", 1)
             for supplier, data in suppliers.items():
-                entry = history._by_drawing[drawing][supplier]
+                entry = history._by_drawing_process[(drawing, code)][supplier]
                 entry["count"] = data["count"]
                 entry["last_used"] = datetime.date.fromisoformat(data["last_used"]) if data["last_used"] else None
-                entry["process_codes"] = Counter(data["process_codes"])
         for code, suppliers in payload["by_process"].items():
             for supplier, data in suppliers.items():
                 entry = history._by_process[code][supplier]

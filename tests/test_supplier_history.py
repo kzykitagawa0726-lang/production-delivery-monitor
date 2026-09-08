@@ -30,14 +30,16 @@ def _row19(supplier="2103", drawing="DWG-A1", process="HB", date=20230115):
     return (1000, supplier, 10, "GEAR", 5, 100, 500, "AB123", 1, 1, 0, drawing, "SCM415", "50X50", date, process, "", "", "")
 
 
-def test_load_aggregates_by_drawing_and_process(tmp_path):
+def test_suggest_requires_drawing_and_process_code_to_both_match(tmp_path):
+    # 図番だけの一致では、別の工程を担当しただけの仕入先が紛れ込んでしまうため、
+    # 図番+工程コードの組み合わせで一致した実績のみを返す(kii-san指摘: 2026-09-08)。
     path = tmp_path / "supplier2023.xlsx"
     make_workbook_19(
         [
             _row19(supplier="2103", drawing="DWG-A1", process="HB", date=20230110),
             _row19(supplier="2103", drawing="DWG-A1", process="HB", date=20230301),
-            _row19(supplier="4016", drawing="DWG-A1", process="MC", date=20230115),
-            _row19(supplier="2103", drawing="DWG-B2", process="HB", date=20230201),
+            _row19(supplier="4016", drawing="DWG-A1", process="MC", date=20230115),  # 同じ図番だが別工程
+            _row19(supplier="2103", drawing="DWG-B2", process="HB", date=20230201),  # 別図番
         ],
         path,
     )
@@ -45,11 +47,15 @@ def test_load_aggregates_by_drawing_and_process(tmp_path):
     history = SupplierHistory.load([path], cache_path=tmp_path / "cache.json")
 
     suggestions = history.suggest("DWG-A1", "HB")
-    assert len(suggestions) == 2  # 2103(2件), 4016(1件)
+    assert len(suggestions) == 1
     assert suggestions[0].supplier_code == "2103"
-    assert suggestions[0].match_type == "drawing"
+    assert suggestions[0].match_type == "drawing_process"
     assert suggestions[0].count == 2
     assert suggestions[0].last_used == datetime.date(2023, 3, 1)
+
+    mc_suggestions = history.suggest("DWG-A1", "MC")
+    assert len(mc_suggestions) == 1
+    assert mc_suggestions[0].supplier_code == "4016"
 
 
 def test_suggest_falls_back_to_process_code_when_drawing_unknown():
