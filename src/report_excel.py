@@ -5,9 +5,13 @@
   2. ①納期遅延リスト(超過日数順)
   3. ②納期遅延リスクリスト(危険度順)
   4. 判定不能・要確認リスト
-  5. 工程別仕掛中ランキング(現在停滞している工程コード別。ボトルネック候補を強調)
+  5. 工程別仕掛中ランキング(現在停滞している工程コード別。ボトルネック候補を強調。
+     --process-data指定時は「参考実績LT(暦日)」列も追加。標準LT(営業日)は変更しない)
   6. 工程別仕入先実績ランキング(--supplier-data指定時のみ。仕入累積データから
-     工程コード別に実績の多い仕入先を集計。①②リストにも代替候補仕入先列を追加する)
+     工程コード別に実績の多い仕入先を集計)
+
+①②リストには「代替候補(社内設備／外注仕入先)」列を追加する
+(--process-data / --supplier-data のどちらか、または両方を指定した場合のみ値が入る)。
 
 工程コード→カテゴリの対応表が未整備の間は、シート5のカテゴリ・ボトルネック表示は
 すべて「その他(未分類)」となる。届き次第、config/process_code_master.csv を
@@ -24,6 +28,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.worksheet import Worksheet
 
 from src.models import OrderRecord
+from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
 from src.report_data import ReportData, build_report_data
 from src.supplier_history import SupplierHistory
@@ -60,10 +65,12 @@ def _current_process_label(r: OrderRecord) -> str:
     return f"{step.process_code} / {step.status}"
 
 
-def _supplier_suggestions_label(r: OrderRecord) -> Optional[str]:
-    if not r.supplier_suggestions:
+def _alternative_suggestions_label(r: OrderRecord) -> Optional[str]:
+    """代替候補(社内設備→外注仕入先の順)。どちらも無ければNone。"""
+    labels = [s.label for s in r.machine_suggestions] + [s.label for s in r.supplier_suggestions]
+    if not labels:
         return None
-    return "; ".join(s.label for s in r.supplier_suggestions)
+    return "; ".join(labels)
 
 
 def _common_row(r: OrderRecord) -> tuple:
@@ -73,14 +80,14 @@ def _common_row(r: OrderRecord) -> tuple:
         _current_process_label(r),
         "はい" if r.is_forecast_order else "",
         r.sales_note or (r.sales_agreed_deadline.isoformat() if r.sales_agreed_deadline else None),
-        r.customer_no, r.old_system_no, _supplier_suggestions_label(r),
+        r.customer_no, r.old_system_no, _alternative_suggestions_label(r),
     )
 
 
 COMMON_HEADERS = [
     "製造オーダー№", "図番", "品名", "数量", "客先注番", "自社納期", "顧客納期",
     "対顧客納期差(日)", "現在工程/ステータス", "内示・先行手配", "営業メモ(納期確認等)", "得意先NO", "製番",
-    "代替候補仕入先",
+    "代替候補(社内設備／外注仕入先)",
 ]
 
 
@@ -105,8 +112,9 @@ def write_excel_report(
     generated_at: datetime.date,
     process_master: ProcessMaster | None = None,
     supplier_history: SupplierHistory | None = None,
+    process_history: ProcessHistory | None = None,
 ) -> None:
-    data = build_report_data(records, generated_at, process_master, supplier_history)
+    data = build_report_data(records, generated_at, process_master, supplier_history, process_history)
 
     wb = Workbook()
 
@@ -194,20 +202,22 @@ def _write_list_sheet(ws: Worksheet, headers: list[str], rows: list[tuple], high
 
 
 def _write_congestion_sheet(ws: Worksheet, data: ReportData) -> None:
-    headers = ["工程コード", "カテゴリ", "仕掛中件数", "標準LT(営業日)", "ボトルネック", "未分類"]
+    headers = ["工程コード", "カテゴリ", "仕掛中件数", "標準LT(営業日)", "参考実績LT(暦日)", "ボトルネック", "未分類"]
     _write_header_row(ws, headers)
     for r_idx, entry in enumerate(data.congestion_ranking, start=2):
         ws.cell(row=r_idx, column=1, value=entry.process_code)
         ws.cell(row=r_idx, column=2, value=entry.category)
         ws.cell(row=r_idx, column=3, value=entry.count)
         ws.cell(row=r_idx, column=4, value=entry.standard_lt_business_days)
-        ws.cell(row=r_idx, column=5, value="★ボトルネック" if entry.is_bottleneck else "")
-        ws.cell(row=r_idx, column=6, value="⚠未分類" if entry.is_unknown_code else "")
+        ws.cell(row=r_idx, column=5, value=entry.actual_lt_calendar_days)
+        ws.cell(row=r_idx, column=6, value="★ボトルネック" if entry.is_bottleneck else "")
+        ws.cell(row=r_idx, column=7, value="⚠未分類" if entry.is_unknown_code else "")
         if entry.is_bottleneck:
-            for c in range(1, 7):
+            for c in range(1, 8):
                 ws.cell(row=r_idx, column=c).fill = BOTTLENECK_FILL
     rows = [
-        (e.process_code, e.category, e.count, e.standard_lt_business_days, e.is_bottleneck, e.is_unknown_code)
+        (e.process_code, e.category, e.count, e.standard_lt_business_days, e.actual_lt_calendar_days,
+         e.is_bottleneck, e.is_unknown_code)
         for e in data.congestion_ranking
     ]
     _autosize_columns(ws, headers, rows)

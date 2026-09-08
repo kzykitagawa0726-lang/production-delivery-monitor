@@ -27,6 +27,9 @@ from openpyxl import load_workbook
 from src.process_master import normalize_process_code
 
 DEFAULT_CACHE_PATH = Path(".cache/supplier_history.json")
+# 集計ロジックを変更したら上げる。ソースファイルが同じでもキャッシュを無効化し、
+# 古いロジックで集計された結果を誤って使い続けないようにするためのガード。
+CACHE_SCHEMA_VERSION = 1
 
 # 2022年のみ列数が少ない簡易フォーマット。2023年以降は55列共通フォーマット。
 HEADER_19 = [
@@ -94,7 +97,7 @@ class SupplierHistory:
 
     @classmethod
     def load(cls, paths: list[Path], cache_path: Path = DEFAULT_CACHE_PATH) -> "SupplierHistory":
-        signature = {str(p): p.stat().st_mtime for p in paths}
+        signature = {"__schema__": CACHE_SCHEMA_VERSION, **{str(p): p.stat().st_mtime for p in paths}}
         cached = _try_load_cache(cache_path, signature)
         if cached is not None:
             return cached

@@ -6,6 +6,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from src.models import Judgement, OrderRecord
+from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
 from src.supplier_history import SupplierHistory, SupplierSuggestion
 
@@ -18,6 +19,9 @@ class CongestionEntry:
     is_bottleneck: bool
     is_unknown_code: bool
     standard_lt_business_days: int
+    # 実績リードタイム中央値(暦日、着手日〜完成日)。--process-data指定時のみ、参考情報として設定される。
+    # 標準LT(標準リードタイム、営業日)は変更しない(kii-san指示)。判定ロジックにも使わない。
+    actual_lt_calendar_days: float | None = None
 
 
 @dataclass
@@ -39,6 +43,7 @@ def build_report_data(
     generated_at: datetime.date,
     process_master: ProcessMaster | None = None,
     supplier_history: SupplierHistory | None = None,
+    process_history: ProcessHistory | None = None,
 ) -> ReportData:
     delayed = sorted(
         (r for r in records if r.judgement == Judgement.DELAYED),
@@ -72,6 +77,10 @@ def build_report_data(
                 )
             )
 
+    if process_history is not None:
+        for entry in congestion_ranking:
+            entry.actual_lt_calendar_days = process_history.actual_lt_calendar_days_median(entry.process_code)
+
     supplier_ranking_by_process: dict[str, list[SupplierSuggestion]] = {}
     if supplier_history is not None:
         # ①②(遅延・リスク)の案件についてのみ、現在工程の代替候補仕入先を算出する。
@@ -84,6 +93,13 @@ def build_report_data(
             suggestions = supplier_history.suggest(None, entry.process_code, top_n=5)
             if suggestions:
                 supplier_ranking_by_process[entry.process_code] = suggestions
+
+    if process_history is not None:
+        # ①②(遅延・リスク)の案件についてのみ、現在工程の代替候補設備(社内)を算出する。
+        for r in (*delayed, *at_risk):
+            current = r.current_process
+            if current is not None:
+                r.machine_suggestions = process_history.suggest_machines(r.drawing_no, current.process_code)
 
     return ReportData(
         generated_at=generated_at,

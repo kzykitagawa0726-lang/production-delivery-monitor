@@ -83,6 +83,10 @@ class OrderRecord:
     # 現在工程(current_process)について、図番一致→工程コード一致の優先順で算出する。
     supplier_suggestions: list = field(default_factory=list)  # list[SupplierSuggestion]
 
+    # 工程累積データ(--process-data)が渡された場合のみ設定される代替候補設備(社内)。
+    # 算出ロジックはsupplier_suggestionsと同様(図番一致優先)。
+    machine_suggestions: list = field(default_factory=list)  # list[MachineSuggestion]
+
     judgement: Optional[Judgement] = None
     judgement_reason: Optional[str] = None
 

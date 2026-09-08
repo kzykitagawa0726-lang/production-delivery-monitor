@@ -28,7 +28,7 @@ def _top_list_rows(records: list[OrderRecord], kind: str) -> str:
             metric = f"残{r.remaining_business_days}営業日"
         current = r.current_process
         current_label = f"{current.process_code}/{current.status}" if current else "(全工程完了)"
-        suppliers = "; ".join(s.label for s in r.supplier_suggestions) if r.supplier_suggestions else ""
+        alternatives = "; ".join(s.label for s in (*r.machine_suggestions, *r.supplier_suggestions))
         rows.append(
             "<tr>"
             f"<td>{_esc(r.order_no)}</td>"
@@ -38,7 +38,7 @@ def _top_list_rows(records: list[OrderRecord], kind: str) -> str:
             f"<td>{_esc(r.company_deadline)}</td>"
             f"<td>{_esc(metric)}</td>"
             f"<td>{_esc(current_label)}</td>"
-            f"<td>{_esc(suppliers)}</td>"
+            f"<td>{_esc(alternatives)}</td>"
             "</tr>"
         )
     if not rows:
@@ -132,7 +132,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <section>
     <h2>① 納期遅延 トップ{top_n}(超過日数順)</h2>
     <table>
-      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>超過</th><th>現在工程</th><th>代替候補仕入先</th></tr></thead>
+      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>超過</th><th>現在工程</th><th>代替候補</th></tr></thead>
       <tbody>{delayed_rows}</tbody>
     </table>
   </section>
@@ -140,7 +140,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <section>
     <h2>② 納期遅延リスク トップ{top_n}(危険度順)</h2>
     <table>
-      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>残営業日</th><th>現在工程</th><th>代替候補仕入先</th></tr></thead>
+      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>残営業日</th><th>現在工程</th><th>代替候補</th></tr></thead>
       <tbody>{risk_rows}</tbody>
     </table>
   </section>
