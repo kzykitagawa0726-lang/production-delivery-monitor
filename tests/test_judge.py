@@ -1,6 +1,6 @@
 import datetime
 
-from src.judge import RISK_THRESHOLD_BUSINESS_DAYS, judge_record
+from src.judge import ANOMALY_THRESHOLD_BUSINESS_DAYS, RISK_THRESHOLD_BUSINESS_DAYS, judge_record
 from src.models import Judgement, OrderRecord
 
 
@@ -10,7 +10,9 @@ def make_record(**overrides) -> OrderRecord:
         drawing_no="312127272601",
         product_name="SPB M10x13T L",
         qty=1,
+        order_date=datetime.date(2026, 8, 1),
         company_deadline=datetime.date(2026, 9, 1),
+        customer_deadline=datetime.date(2026, 9, 5),
         remaining_business_days=20,
     )
     defaults.update(overrides)
@@ -52,3 +54,27 @@ def test_boundary_zero_is_at_risk():
     record = make_record(remaining_business_days=0)
     judge_record(record)
     assert record.judgement == Judgement.AT_RISK
+
+
+def test_undetermined_when_remaining_days_anomalously_large():
+    # 実データで確認された、自社納期の誤入力(数十年先)による極端な残日を想定
+    record = make_record(remaining_business_days=ANOMALY_THRESHOLD_BUSINESS_DAYS + 1)
+    judge_record(record)
+    assert record.judgement == Judgement.UNDETERMINED
+    assert "異常" in record.judgement_reason
+
+
+def test_undetermined_when_remaining_days_anomalously_overdue():
+    # 実データで確認された、安全在庫案件(自社納期が数年前の固定値)を想定。
+    # ①遅延として埋もれさせず、判定不能として設定変更の必要性が分かるようにする(kii-san確認済み)。
+    record = make_record(remaining_business_days=-(ANOMALY_THRESHOLD_BUSINESS_DAYS + 1))
+    judge_record(record)
+    assert record.judgement == Judgement.UNDETERMINED
+    assert "設定変更" in record.judgement_reason
+
+
+def test_forecast_order_is_still_judged_normally():
+    # 内示・先行手配(受注日・顧客納期未設定)でも、自社納期・残日があれば通常通り判定する
+    record = make_record(order_date=None, customer_deadline=None, remaining_business_days=-2, is_forecast_order=True)
+    judge_record(record)
+    assert record.judgement == Judgement.DELAYED

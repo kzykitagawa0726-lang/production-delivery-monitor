@@ -1,0 +1,10 @@
+{
+  "categories": {
+    "熱処理系": { "standard_lt_business_days": 10 },
+    "歯切り系": { "standard_lt_business_days": 5 },
+    "研磨系": { "standard_lt_business_days": 5 },
+    "検査": { "standard_lt_business_days": 3 },
+    "その他": { "standard_lt_business_days": 5 }
+  },
+  "unknown_code_category": "その他"
+}

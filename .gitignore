@@ -5,3 +5,4 @@ output/*/
 !output/.gitkeep
 *.xlsx
 !config/*.xlsx
+.cache/

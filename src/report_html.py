@@ -1,10 +1,13 @@
 """オフライン単体HTMLレポート出力。
 
-外部CDN・外部通信は一切使用しない。CSSはインラインで埋め込む。
-工程進捗データを使わない方針のため、工程別混雑グラフは本バージョンでは含まない。
+外部CDN・外部通信は一切使用しない。CSSはインラインで埋め込み、グラフはライブラリを
+使わずSVGで手描きする。--process-data指定時は、週別の折れ線グラフを2つ表示する:
+「週別予測負荷」(これから先、標準LTベースの需要予測)と「週別負荷実績」(過去の振り返り)。
+向きが逆(未来/過去)の別物なので、セクション見出しと注記で明確に区別している。
 """
 from __future__ import annotations
 
+import datetime
 import html
 from pathlib import Path
 
@@ -12,6 +15,7 @@ from src.models import OrderRecord
 from src.report_data import ReportData
 
 TOP_N = 10
+CHART_TOP_N = 15
 
 
 def _esc(value) -> str:
@@ -25,6 +29,9 @@ def _top_list_rows(records: list[OrderRecord], kind: str) -> str:
             metric = f"{-r.remaining_business_days}営業日超過"
         else:
             metric = f"残{r.remaining_business_days}営業日"
+        current = r.current_process
+        current_label = f"{current.process_code}/{current.status}" if current else "(全工程完了)"
+        alternatives = "; ".join(s.label for s in (*r.machine_suggestions, *r.supplier_suggestions))
         rows.append(
             "<tr>"
             f"<td>{_esc(r.order_no)}</td>"
@@ -33,11 +40,167 @@ def _top_list_rows(records: list[OrderRecord], kind: str) -> str:
             f"<td>{_esc(r.customer_order_no)}</td>"
             f"<td>{_esc(r.company_deadline)}</td>"
             f"<td>{_esc(metric)}</td>"
+            f"<td>{_esc(current_label)}</td>"
+            f"<td>{_esc(alternatives)}</td>"
             "</tr>"
         )
     if not rows:
-        return '<tr><td colspan="6">該当なし</td></tr>'
+        return '<tr><td colspan="8">該当なし</td></tr>'
     return "".join(rows)
+
+
+WEEKLY_CHART_WEEKS = 16
+WEEKLY_CHART_TOP_DEPARTMENTS = 8
+LINE_COLORS = [
+    "#4f7cff", "#e35d5d", "#f0ad4e", "#2ea043", "#9a6fd8",
+    "#17a2b8", "#d6336c", "#6c757d",
+]
+
+
+def _weekly_department_line_chart_svg(
+    points: list[tuple], empty_message: str, aria_label: str, take: str = "last"
+) -> str:
+    """部署別・週次工数の折れ線グラフ(上位のみ)。
+
+    部署数(13種類)が多いため、対象期間内の合計工数が多い上位のみを表示する。
+    take="last"は直近WEEKLY_CHART_WEEKS週(実績用)、"first"は今後WEEKLY_CHART_WEEKS週
+    (予測用、予測データは未来の週しか無いため先頭から取る)。
+    """
+    if not points:
+        return f"<p>{_esc(empty_message)}</p>"
+
+    all_weeks = sorted({week for week, _, _ in points})
+    weeks = all_weeks[-WEEKLY_CHART_WEEKS:] if take == "last" else all_weeks[:WEEKLY_CHART_WEEKS]
+    week_set = set(weeks)
+
+    totals: dict[str, float] = {}
+    grid: dict[tuple, float] = {}
+    for week, dept, hours in points:
+        if week in week_set:
+            totals[dept] = totals.get(dept, 0.0) + hours
+            grid[(week, dept)] = hours
+
+    top_departments = [d for d, _ in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:WEEKLY_CHART_TOP_DEPARTMENTS]]
+    if not top_departments or not weeks:
+        return f"<p>{_esc(empty_message)}</p>"
+
+    chart_width, chart_height = 640, 260
+    margin_left, margin_bottom, margin_top = 40, 30, 10
+    plot_w = chart_width - margin_left - 10
+    plot_h = chart_height - margin_top - margin_bottom
+    max_hours = max((grid.get((w, d), 0.0) for w in weeks for d in top_departments), default=0.0) or 1.0
+    step_x = plot_w / max(len(weeks) - 1, 1)
+
+    def xy(i: int, hours: float) -> tuple[float, float]:
+        x = margin_left + i * step_x
+        y = margin_top + plot_h - (hours / max_hours) * plot_h
+        return x, y
+
+    lines = []
+    legend = []
+    for ci, dept in enumerate(top_departments):
+        color = LINE_COLORS[ci % len(LINE_COLORS)]
+        coords = [xy(i, grid.get((w, dept), 0.0)) for i, w in enumerate(weeks)]
+        path = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+        lines.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2"></polyline>')
+        legend.append(
+            f'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;">'
+            f'<span style="width:10px;height:10px;background:{color};border-radius:2px;display:inline-block;"></span>'
+            f"部署{_esc(dept)}</span>"
+        )
+
+    x_labels = []
+    label_every = max(len(weeks) // 8, 1)
+    for i, w in enumerate(weeks):
+        if i % label_every == 0 or i == len(weeks) - 1:
+            x, _ = xy(i, 0)
+            x_labels.append(
+                f'<text x="{x:.1f}" y="{chart_height - 8}" text-anchor="middle" class="chart-label">'
+                f"{w.strftime('%m/%d')}</text>"
+            )
+
+    y_labels = []
+    for frac in (0, 0.5, 1.0):
+        y = margin_top + plot_h - frac * plot_h
+        val = max_hours * frac
+        y_labels.append(f'<text x="4" y="{y + 4:.1f}" class="chart-value">{val:.0f}</text>')
+
+    svg = (
+        f'<svg viewBox="0 0 {chart_width} {chart_height}" width="100%" height="{chart_height}" '
+        f'role="img" aria-label="{_esc(aria_label)}">'
+        + "".join(y_labels) + "".join(x_labels) + "".join(lines)
+        + "</svg>"
+    )
+    return svg + '<div style="margin-top:8px;">' + "".join(legend) + "</div>"
+
+
+def _congestion_bar_chart_svg(data: ReportData) -> str:
+    entries = data.congestion_ranking[:CHART_TOP_N]
+    if not entries:
+        return "<p>工程進捗データがありません。</p>"
+
+    max_count = max(e.count for e in entries)
+    bar_height = 24
+    gap = 8
+    label_width = 160
+    chart_width = 480
+    row_height = bar_height + gap
+    svg_height = row_height * len(entries) + gap
+
+    bars = []
+    for i, e in enumerate(entries):
+        y = gap + i * row_height
+        bar_w = (e.count / max_count) * chart_width if max_count else 0
+        color = "#e35d5d" if e.is_bottleneck else ("#9aa0a6" if e.is_unknown_code else "#4f7cff")
+        label = f"{e.process_code} ({e.category})" if not e.is_unknown_code else f"{e.process_code} (未分類)"
+        bars.append(
+            f'<text x="{label_width - 8}" y="{y + bar_height * 0.7}" text-anchor="end" '
+            f'class="chart-label">{_esc(label)}</text>'
+            f'<rect x="{label_width}" y="{y}" width="{bar_w:.1f}" height="{bar_height}" fill="{color}" rx="3"></rect>'
+            f'<text x="{label_width + bar_w + 6}" y="{y + bar_height * 0.7}" class="chart-value">{e.count}</text>'
+        )
+
+    total_width = label_width + chart_width + 60
+    return (
+        f'<svg viewBox="0 0 {total_width} {svg_height}" width="100%" height="{svg_height}" '
+        'role="img" aria-label="工程別仕掛中件数">'
+        + "".join(bars)
+        + "</svg>"
+    )
+
+
+def _monthly_category_capacity_rows(data: ReportData) -> str:
+    """品種別月間キャパシティの表(直近2か月+今後の予測月のみ、ざっくり見る用途のため絞り込む)。
+
+    詳細な全期間は Excel の「品種別月間キャパシティ」シートを参照する前提。
+    """
+    if not data.monthly_category_capacity:
+        return '<tr><td colspan="6">工程累積データが指定されていません。</td></tr>'
+
+    cutoff_month = (data.generated_at.replace(day=1) - datetime.timedelta(days=60)).strftime("%Y-%m")
+    rows = [e for e in data.monthly_category_capacity if e.month >= cutoff_month]
+    if not rows:
+        rows = data.monthly_category_capacity
+
+    out = []
+    for e in rows:
+        actual = f"{e.actual_hours:.0f}" if e.actual_hours is not None else "—"
+        forecast = f"{e.forecast_hours:.0f}" if e.forecast_hours is not None else "—"
+        capacity = f"{e.capacity_hours_typical:.0f}" if e.capacity_hours_typical is not None else "—"
+        fulfillment = f"{e.fulfillment_rate * 100:.0f}%" if e.fulfillment_rate is not None else "—"
+        over_capacity = e.fulfillment_rate is not None and e.fulfillment_rate > 1.0
+        fulfillment_style = ' style="color:#d6336c;font-weight:600;"' if over_capacity else ""
+        out.append(
+            "<tr>"
+            f"<td>{_esc(e.month)}</td>"
+            f"<td>{_esc(e.category)}</td>"
+            f"<td>{actual}</td>"
+            f"<td>{forecast}</td>"
+            f"<td>{capacity}</td>"
+            f"<td{fulfillment_style}>{fulfillment}</td>"
+            "</tr>"
+        )
+    return "".join(out)
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -57,6 +220,8 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .card.delayed {{ border-top-color: #e35d5d; }}
   .card.risk {{ border-top-color: #f0ad4e; }}
   .card.undetermined {{ border-top-color: #9aa0a6; }}
+  .card.forecast {{ border-top-color: #4f7cff; }}
+  .card.infeasible {{ border-top-color: #d6336c; }}
   .card .label {{ font-size: 0.9rem; color: #6b7280; }}
   .card .value {{ font-size: 2.2rem; font-weight: 700; margin-top: 4px; }}
   section {{ background: #fff; border-radius: 10px; padding: 20px 24px; margin-bottom: 24px;
@@ -65,10 +230,15 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
   th, td {{ text-align: left; padding: 6px 10px; border-bottom: 1px solid #e5e7eb; }}
   th {{ background: #305496; color: #fff; }}
+  .chart-label {{ font-size: 12px; fill: #1f2430; }}
+  .chart-value {{ font-size: 12px; fill: #1f2430; }}
+  .warning {{ color: #9c0006; font-size: 0.85rem; margin-top: 8px; }}
+  .note {{ color: #6b7280; font-size: 0.85rem; margin-top: 8px; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #14161a; color: #e5e7eb; }}
     .card, section {{ background: #1f2229; box-shadow: none; border: 1px solid #2c313a; }}
     th, td {{ border-bottom-color: #2c313a; }}
+    .chart-label, .chart-value {{ fill: #e5e7eb; }}
   }}
 </style>
 </head>
@@ -80,12 +250,14 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="card delayed"><div class="label">① 納期遅延(超過)</div><div class="value">{delayed_count}</div></div>
     <div class="card risk"><div class="label">② 納期遅延リスク(残5営業日以内)</div><div class="value">{risk_count}</div></div>
     <div class="card undetermined"><div class="label">判定不能・要確認</div><div class="value">{undetermined_count}</div></div>
+    <div class="card forecast"><div class="label">(参考)内示・先行手配</div><div class="value">{forecast_count}</div></div>
+    <div class="card infeasible"><div class="label">(参考)実績ベースで納期に間に合わない見込み</div><div class="value">{infeasible_count}</div></div>
   </div>
 
   <section>
     <h2>① 納期遅延 トップ{top_n}(超過日数順)</h2>
     <table>
-      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>超過</th></tr></thead>
+      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>超過</th><th>現在工程</th><th>代替候補</th></tr></thead>
       <tbody>{delayed_rows}</tbody>
     </table>
   </section>
@@ -93,9 +265,46 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   <section>
     <h2>② 納期遅延リスク トップ{top_n}(危険度順)</h2>
     <table>
-      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>残営業日</th></tr></thead>
+      <thead><tr><th>製造オーダー№</th><th>図番</th><th>品名</th><th>客先注番</th><th>自社納期</th><th>残営業日</th><th>現在工程</th><th>代替候補</th></tr></thead>
       <tbody>{risk_rows}</tbody>
     </table>
+  </section>
+
+  <section>
+    <h2>工程別 仕掛中件数(現在停滞している工程コード別)</h2>
+    {congestion_chart}
+    {unknown_warning}
+  </section>
+
+  <section>
+    <h2>週別予測負荷 上位部署(今後{weekly_chart_weeks}週、標準LTベースの需要予測)</h2>
+    {capacity_forecast_chart}
+    <p class="note">
+      ※ 仕掛中の受注の残り工程を、標準LT(営業日、実績日数ではない)で先の週へ積み上げた予測です。
+      工数の大きさ・部署配分は過去実績の按分によります。設備のキャパシティ上限との比較はまだできません
+      (上限データが届き次第、充足率として発展させます)。全部署・全設備の詳細はExcelの「週別予測負荷」シートをご覧ください。
+    </p>
+  </section>
+
+  <section>
+    <h2>週別負荷実績 上位部署(直近{weekly_chart_weeks}週、過去の実績工数)</h2>
+    {weekly_load_chart}
+    <p class="note">※ こちらは過去の振り返りです。全部署・全設備・全期間の詳細はExcelの「週別負荷実績」シートをご覧ください。</p>
+  </section>
+
+  <section>
+    <h2>品種別月間キャパシティ(GEAR/BEVEL/WORM、営業向けざっくり参考資料)</h2>
+    <table>
+      <thead><tr><th>月</th><th>品種</th><th>実績工数</th><th>予測工数</th><th>キャパシティ目安(稼働率35%)</th><th>予測充足率</th></tr></thead>
+      <tbody>{monthly_category_capacity_rows}</tbody>
+    </table>
+    <p class="note">
+      ※ キャパシティ目安は設備の物理上限の実測値ではなく、「弊社の稼働率はだいたい30〜40%(24時間を100%とした場合)」
+      というご申告値をもとに、過去の典型的な実績月間工数を逆算した推定値です(表示は中間値35%の目安)。
+      予測工数は仕掛中受注の残り工程を標準LTで先の月へ積み上げ、受注の品名から判定した品種で集計したものです。
+      品名から品種を判定できない受注は集計から除外しています。保守的/楽観的レンジ・1営業日あたり(月20日換算)の目安・
+      全期間の詳細はExcelの「品種別月間キャパシティ」シートをご覧ください。
+    </p>
   </section>
 </body>
 </html>
@@ -103,15 +312,40 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 
 
 def write_html_report(data: ReportData, output_path: Path) -> None:
+    unknown_warning = ""
+    if data.unknown_process_codes:
+        unknown_warning = (
+            f'<p class="warning">⚠ {len(data.unknown_process_codes)}件の工程コードが '
+            "工程コード対応表(config/process_code_master.csv)に未登録のため「未分類」表示です。"
+            "対応表が届き次第、正しいカテゴリ・ボトルネック区分に更新されます。</p>"
+        )
+
+    infeasible_count = sum(1 for e in data.feasibility_estimates if e.status == "間に合わない見込み")
+    infeasible_display = infeasible_count if data.feasibility_estimates else "—"
+
     page = PAGE_TEMPLATE.format(
         generated_at=_esc(data.generated_at.isoformat()),
         total_count=data.total_count,
         delayed_count=len(data.delayed),
         risk_count=len(data.at_risk),
         undetermined_count=len(data.undetermined),
+        forecast_count=data.forecast_order_count,
+        infeasible_count=infeasible_display,
         top_n=TOP_N,
         delayed_rows=_top_list_rows(data.delayed, "delayed"),
         risk_rows=_top_list_rows(data.at_risk, "risk"),
+        congestion_chart=_congestion_bar_chart_svg(data),
+        unknown_warning=unknown_warning,
+        weekly_chart_weeks=WEEKLY_CHART_WEEKS,
+        weekly_load_chart=_weekly_department_line_chart_svg(
+            data.weekly_load_by_department, "工程累積データが指定されていません。",
+            "週別部署別実績工数", take="last",
+        ),
+        capacity_forecast_chart=_weekly_department_line_chart_svg(
+            data.capacity_forecast_by_department, "工程累積データが指定されていないか、予測対象の仕掛中受注がありません。",
+            "週別部署別予測工数", take="first",
+        ),
+        monthly_category_capacity_rows=_monthly_category_capacity_rows(data),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
