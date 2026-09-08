@@ -35,6 +35,11 @@ kii-san提供の複数年分の工程実績Excel(基幹システムからのエ�
   「参考情報」としてのみ提供する(判定ロジックには使わない)。
 - 負荷(週別工数)は「実績総工数」列を使う。週は完成日が属するISO週(月曜始まり)。
   着手日〜完成日にまたがる稼働を日別に按分してはいない(MVP。必要なら精緻化する)。
+- 品名の先頭語(月別に集計。分類そのものはsrc/product_category.pyが担当)から、
+  月別・品種別(GEAR/BEVEL/WORM)の実績工数も集計する(2026-09-08 kii-san要望:
+  営業向けの品種別月間キャパシティ可視化)。キャッシュには分類前の「先頭語」単位で
+  保存し、実際の品種分類はreport_data.py側で行う(config/product_category_keywords.csv
+  を編集しても、高コストなExcel再読み込みをせずに反映されるようにするため)。
 - 入力ファイルは仕入累積データと同様に更新頻度が低く数十万行規模になるため、
   集計結果のみをローカルキャッシュ(.cache/process_history.json、gitには含めない)に
   保存し、入力ファイル一式が変わらない限り再読み込みを省略する。
@@ -56,7 +61,7 @@ from src.process_master import normalize_process_code
 DEFAULT_CACHE_PATH = Path(".cache/process_history.json")
 # 集計ロジックを変更したら上げる。ソースファイルが同じでもキャッシュを無効化し、
 # 古いロジックで集計された結果を誤って使い続けないようにするためのガード。
-CACHE_SCHEMA_VERSION = 6
+CACHE_SCHEMA_VERSION = 7
 
 IDX_ORDER_NO = 0
 IDX_LINE = 1  # 行(受注№と組み合わせて1つの工程ルート=インスタンスを識別)
@@ -66,6 +71,7 @@ IDX_PROC_CODE = 5
 IDX_DEPARTMENT = 8  # 加工先。数値・13種類のみのため部署/コストセンターコードと推測
 IDX_MACHINE = 11  # 予定機械。週次WIPデータの「加工先」と94%一致(確認済み)
 IDX_ACTUAL_MANHOURS = 24  # 実績側の総工数
+IDX_PRODUCT_NAME = 31  # 品名(先頭語がGEAR/BEVEL/WORM等の品種を表す。src/product_category.py参照)
 IDX_START = 90  # 着手日(実作業開始日、kii-san確認済み)
 IDX_ACTUAL_COMPLETE = 92  # 完成日
 
@@ -127,6 +133,12 @@ def _week_start(d: datetime.date) -> datetime.date:
     return d - datetime.timedelta(days=d.weekday())  # 月曜始まり
 
 
+def _first_token(product_name) -> str:
+    """品名の先頭語を取り出す(全角スペースも区切りとして扱う)。品種分類の判定材料。"""
+    text = str(product_name).replace("　", " ").strip()
+    return text.split(" ")[0] if text else ""
+
+
 class ProcessHistory:
     def __init__(self) -> None:
         # by_drawing_process[(図番, 工程コード)][設備コード] = {"count": int, "last_used": date|None}
@@ -160,6 +172,9 @@ class ProcessHistory:
         # manhours_by_process[工程コード] = [実績工数, ...](将来予測負荷で、工程1件あたりの
         # 典型的な工数を推定するために使う。平均を採用)
         self._manhours_by_process: dict[str, list[float]] = defaultdict(list)
+        # monthly_load_by_product_token[(月"YYYY-MM", 品名の先頭語)] = 実績工数合計。
+        # 品種(GEAR/BEVEL/WORM)への分類はreport_data.py側で行う(理由は上記docstring参照)。
+        self._monthly_load_by_product_token: dict[tuple[str, str], float] = defaultdict(float)
 
     @classmethod
     def load(cls, paths: list[Path], cache_path: Path = DEFAULT_CACHE_PATH) -> "ProcessHistory":
@@ -232,6 +247,11 @@ class ProcessHistory:
                 self._department_counts_by_process[process_code][department] += 1
             if has_manhours:
                 self._manhours_by_process[process_code].append(manhours)
+                if complete_date:
+                    month = complete_date.strftime("%Y-%m")
+                    token = _first_token(row[IDX_PRODUCT_NAME])
+                    if token:
+                        self._monthly_load_by_product_token[(month, token)] += manhours
 
             order_no = str(row[IDX_ORDER_NO]).strip() if row[IDX_ORDER_NO] not in (None, "") else None
             line = str(row[IDX_LINE]).strip() if row[IDX_LINE] not in (None, "") else None
@@ -403,6 +423,17 @@ class ProcessHistory:
             key=lambda t: (t[0], t[1]),
         )
 
+    def monthly_load_by_product_token(self) -> list[tuple[str, str, float]]:
+        """(月"YYYY-MM", 品名の先頭語, 実績工数合計) のリスト。月昇順。
+
+        品種(GEAR/BEVEL/WORM)への分類はここでは行わない
+        (src/product_category.py + report_data.pyが担当。理由はモジュールdocstring参照)。
+        """
+        return sorted(
+            ((month, token, hours) for (month, token), hours in self._monthly_load_by_product_token.items()),
+            key=lambda t: (t[0], t[1]),
+        )
+
     # --- 将来予測負荷(report_data.build_capacity_forecastが使用) ---
 
     def average_manhours_for_process(self, process_code: str) -> Optional[float]:
@@ -476,6 +507,10 @@ class ProcessHistory:
                 code: dict(counts) for code, counts in self._department_counts_by_process.items()
             },
             "manhours_by_process": dict(self._manhours_by_process),
+            "monthly_load_by_product_token": {
+                f"{month}\x1f{token}": hours
+                for (month, token), hours in self._monthly_load_by_product_token.items()
+            },
         }
 
     @classmethod
@@ -514,6 +549,9 @@ class ProcessHistory:
             history._department_counts_by_process[code] = Counter(counts)
         for code, values in payload.get("manhours_by_process", {}).items():
             history._manhours_by_process[code] = list(values)
+        for key, hours in payload.get("monthly_load_by_product_token", {}).items():
+            month, token = key.split("\x1f", 1)
+            history._monthly_load_by_product_token[(month, token)] = hours
         return history
 
 

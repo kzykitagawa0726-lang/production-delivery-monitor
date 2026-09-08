@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import html
 from pathlib import Path
 
@@ -168,6 +169,40 @@ def _congestion_bar_chart_svg(data: ReportData) -> str:
     )
 
 
+def _monthly_category_capacity_rows(data: ReportData) -> str:
+    """品種別月間キャパシティの表(直近2か月+今後の予測月のみ、ざっくり見る用途のため絞り込む)。
+
+    詳細な全期間は Excel の「品種別月間キャパシティ」シートを参照する前提。
+    """
+    if not data.monthly_category_capacity:
+        return '<tr><td colspan="6">工程累積データが指定されていません。</td></tr>'
+
+    cutoff_month = (data.generated_at.replace(day=1) - datetime.timedelta(days=60)).strftime("%Y-%m")
+    rows = [e for e in data.monthly_category_capacity if e.month >= cutoff_month]
+    if not rows:
+        rows = data.monthly_category_capacity
+
+    out = []
+    for e in rows:
+        actual = f"{e.actual_hours:.0f}" if e.actual_hours is not None else "—"
+        forecast = f"{e.forecast_hours:.0f}" if e.forecast_hours is not None else "—"
+        capacity = f"{e.capacity_hours_typical:.0f}" if e.capacity_hours_typical is not None else "—"
+        fulfillment = f"{e.fulfillment_rate * 100:.0f}%" if e.fulfillment_rate is not None else "—"
+        over_capacity = e.fulfillment_rate is not None and e.fulfillment_rate > 1.0
+        fulfillment_style = ' style="color:#d6336c;font-weight:600;"' if over_capacity else ""
+        out.append(
+            "<tr>"
+            f"<td>{_esc(e.month)}</td>"
+            f"<td>{_esc(e.category)}</td>"
+            f"<td>{actual}</td>"
+            f"<td>{forecast}</td>"
+            f"<td>{capacity}</td>"
+            f"<td{fulfillment_style}>{fulfillment}</td>"
+            "</tr>"
+        )
+    return "".join(out)
+
+
 PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -256,6 +291,21 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     {weekly_load_chart}
     <p class="note">※ こちらは過去の振り返りです。全部署・全設備・全期間の詳細はExcelの「週別負荷実績」シートをご覧ください。</p>
   </section>
+
+  <section>
+    <h2>品種別月間キャパシティ(GEAR/BEVEL/WORM、営業向けざっくり参考資料)</h2>
+    <table>
+      <thead><tr><th>月</th><th>品種</th><th>実績工数</th><th>予測工数</th><th>キャパシティ目安(稼働率35%)</th><th>予測充足率</th></tr></thead>
+      <tbody>{monthly_category_capacity_rows}</tbody>
+    </table>
+    <p class="note">
+      ※ キャパシティ目安は設備の物理上限の実測値ではなく、「弊社の稼働率はだいたい30〜40%(24時間を100%とした場合)」
+      というご申告値をもとに、過去の典型的な実績月間工数を逆算した推定値です(表示は中間値35%の目安)。
+      予測工数は仕掛中受注の残り工程を標準LTで先の月へ積み上げ、受注の品名から判定した品種で集計したものです。
+      品名から品種を判定できない受注は集計から除外しています。保守的/楽観的レンジ・1営業日あたり(月20日換算)の目安・
+      全期間の詳細はExcelの「品種別月間キャパシティ」シートをご覧ください。
+    </p>
+  </section>
 </body>
 </html>
 """
@@ -295,6 +345,7 @@ def write_html_report(data: ReportData, output_path: Path) -> None:
             data.capacity_forecast_by_department, "工程累積データが指定されていないか、予測対象の仕掛中受注がありません。",
             "週別部署別予測工数", take="first",
         ),
+        monthly_category_capacity_rows=_monthly_category_capacity_rows(data),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

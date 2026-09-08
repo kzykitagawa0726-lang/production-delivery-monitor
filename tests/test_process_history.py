@@ -11,6 +11,7 @@ from src.process_history import (
     IDX_MACHINE,
     IDX_PROC_CODE,
     IDX_PROC_SEQ,
+    IDX_PRODUCT_NAME,
     IDX_START,
     ProcessHistory,
 )
@@ -22,7 +23,7 @@ NUM_COLS = 98
 
 def _row(
     order_no="AB123", line="1", drawing="DWG-A1", process="HB", machine="KW451",
-    start=20230101, complete=20230110, seq=1, department="1223", manhours=0,
+    start=20230101, complete=20230110, seq=1, department="1223", manhours=0, product_name="",
 ):
     values = [0] * NUM_COLS
     values[0] = order_no
@@ -35,6 +36,7 @@ def _row(
     values[IDX_MACHINE] = machine
     values[67] = 1  # 作業完了
     values[IDX_ACTUAL_MANHOURS] = manhours
+    values[IDX_PRODUCT_NAME] = product_name
     values[IDX_START] = start
     values[IDX_ACTUAL_COMPLETE] = complete
     return tuple(values)
@@ -238,6 +240,24 @@ def test_weekly_load_by_department_and_machine(tmp_path):
     by_machine = {(w, m): h for w, m, h in history.weekly_load_by_machine()}
     assert by_machine[(week, "KW451")] == 3.5
     assert by_machine[(week, "KB400")] == 3.0
+
+
+def test_monthly_load_by_product_token(tmp_path):
+    path = tmp_path / "process2023.xlsx"
+    make_workbook(
+        [
+            _row(complete=20230105, manhours=2.0, product_name="ＧＥＡＲ　Ｍ６ｘ６０　Ｓ"),
+            _row(complete=20230120, manhours=3.0, product_name="ＧＥＡＲ　Ｍ３Ｘ２４Ｔ"),  # 同月・同トークン
+            _row(complete=20230201, manhours=1.5, product_name="ＳＰＢ　Ｍ３Ｘ２４Ｔ　Ｌ"),  # 翌月・別トークン
+        ],
+        path,
+    )
+
+    history = ProcessHistory.load([path], cache_path=tmp_path / "cache.json")
+    points = {(m, t): h for m, t, h in history.monthly_load_by_product_token()}
+
+    assert points[("2023-01", "ＧＥＡＲ")] == 5.0  # 同月・同トークンは合算される
+    assert points[("2023-02", "ＳＰＢ")] == 1.5
 
 
 def test_cache_is_reused_when_source_files_unchanged(tmp_path):

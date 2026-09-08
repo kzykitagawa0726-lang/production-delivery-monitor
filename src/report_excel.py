@@ -16,6 +16,8 @@
   10. 週別予測負荷(部署別)/11. 週別予測負荷(設備別)(--process-data指定時のみ。
      仕掛中の受注の残り工程を標準LTで先の週へ積み上げた「これから」の需要予測。
      8・9とは向き[過去/未来]が異なる別物なので混同しないよう注意)
+  12. 品種別月間キャパシティ(GEAR/BEVEL/WORM)(--process-data指定時のみ。稼働率30〜40%からの
+     逆算によるキャパシティ目安と、月別の実績・予測工数を品種別に並べた営業向けのざっくり参考資料)
 
 ①②リストには「代替候補(社内設備／外注仕入先)」列を追加する
 (--process-data / --supplier-data のどちらか、または両方を指定した場合のみ値が入る)。
@@ -37,6 +39,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from src.models import OrderRecord
 from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
+from src.product_category import ProductCategoryClassifier
 from src.report_data import ReportData, build_report_data
 from src.supplier_history import SupplierHistory
 
@@ -120,8 +123,11 @@ def write_excel_report(
     process_master: ProcessMaster | None = None,
     supplier_history: SupplierHistory | None = None,
     process_history: ProcessHistory | None = None,
+    product_category_classifier: ProductCategoryClassifier | None = None,
 ) -> None:
-    data = build_report_data(records, generated_at, process_master, supplier_history, process_history)
+    data = build_report_data(
+        records, generated_at, process_master, supplier_history, process_history, product_category_classifier
+    )
 
     wb = Workbook()
 
@@ -168,6 +174,8 @@ def write_excel_report(
             wb.create_sheet("週別予測負荷(設備別)"), data.capacity_forecast_by_machine, "予測工数合計"
         )
         _write_capacity_forecast_note(wb["週別予測負荷(設備別)"])
+    if data.monthly_category_capacity:
+        _write_monthly_category_capacity_sheet(wb.create_sheet("品種別月間キャパシティ"), data)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -362,6 +370,55 @@ def _write_weekly_machine_list_sheet(
             ws.cell(row=r_idx, column=c_idx, value=value)
     _autosize_columns(ws, headers, rows)
     ws.freeze_panes = "A2"
+
+
+def _write_monthly_category_capacity_sheet(ws: Worksheet, data: ReportData) -> None:
+    """品種(GEAR/BEVEL/WORM)別・月別のキャパシティ参考資料(--process-data指定時のみ)。
+
+    ①②の判定・実績ベース納期充足予測・週別(予測)負荷とは独立した、追加の参考情報。
+    月×品種の行に、実績工数・予測工数・稼働率30〜40%から逆算したキャパシティ目安を並べる。
+    """
+    headers = [
+        "月", "品種", "実績工数合計", "予測工数合計",
+        "キャパシティ目安(稼働率35%)", "キャパシティ下限(稼働率40%・保守的)",
+        "キャパシティ上限(稼働率30%・楽観的)", "キャパシティ目安(1営業日あたり、月20日換算)",
+        "予測充足率(予測÷目安)",
+    ]
+    _write_header_row(ws, headers)
+    rows: list[tuple] = []
+    for r_idx, e in enumerate(data.monthly_category_capacity, start=2):
+        row = (
+            e.month, e.category, e.actual_hours, e.forecast_hours,
+            e.capacity_hours_typical, e.capacity_hours_low, e.capacity_hours_high,
+            e.capacity_hours_typical_per_business_day, e.fulfillment_rate,
+        )
+        rows.append(row)
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+        if e.fulfillment_rate is not None and e.fulfillment_rate > 1.0:
+            ws.cell(row=r_idx, column=1).fill = DELAYED_FILL
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"
+
+    note_row = ws.max_row + 2
+    ws.cell(
+        row=note_row, column=1,
+        value=(
+            "※ これは営業がおおまかに月間キャパシティ感をつかむための参考資料です(受注時のご参考に)。"
+            "①②の判定・実績ベース納期充足予測とは独立しています。"
+            "キャパシティ目安は、設備の物理的な上限を測定したものではなく、「弊社の稼働率はだいたい"
+            "30〜40%(24時間を100%とした場合)」というご申告値をもとに、過去の典型的な実績月間工数を"
+            "その稼働率で逆算した推定値です(稼働率が低いほどキャパシティは大きく出るため、"
+            "40%を保守的な下限、30%を楽観的な上限としています)。実績月間工数は、算出時点の月(まだ"
+            "確定していない)を除いた直近12か月の平均です。予測工数は、仕掛中の受注の残り工程を"
+            "標準LTで先の月へ積み上げ、受注自身の品名から判定した品種(GEAR/BEVEL/WORM)で集計した"
+            "ものです(部署・設備別の予測とは別の切り口)。品名から品種を判定できない受注"
+            "(付随部品や型番のみの表記など)は集計から除外しています。"
+            "「1営業日あたり」の列は、月間キャパシティ目安を弊社の平均営業日数(月20日)で単純に"
+            "割った参考値です(月ごとの実際の営業日数の違いは考慮していません)。"
+        ),
+    )
+    ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
 
 
 def _write_capacity_forecast_note(ws: Worksheet) -> None:

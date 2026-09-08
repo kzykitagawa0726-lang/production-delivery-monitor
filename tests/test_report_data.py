@@ -3,7 +3,8 @@ import datetime
 from src.models import OrderRecord, ProcessStep
 from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
-from src.report_data import build_capacity_forecast, build_feasibility_estimates
+from src.product_category import ProductCategoryClassifier
+from src.report_data import build_capacity_forecast, build_feasibility_estimates, build_monthly_category_capacity
 
 GENERATED_AT = datetime.date(2026, 9, 8)  # 火曜日
 
@@ -42,6 +43,16 @@ def make_history_with_order_level_lt(drawing_no: str, days: int, sample_count: i
     history = ProcessHistory()
     history._order_level_durations_by_drawing[drawing_no] = [days] * sample_count
     return history
+
+
+def make_classifier(tmp_path, rows: list[tuple[str, str]]) -> ProductCategoryClassifier:
+    """(keyword, category) からテスト用の品種対応表を作る。"""
+    path = tmp_path / "keywords.csv"
+    lines = ["keyword,category"]
+    for keyword, category in rows:
+        lines.append(f"{keyword},{category}")
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return ProductCategoryClassifier(keywords_path=path)
 
 
 def test_feasibility_uses_order_date_plus_drawing_typical_lt():
@@ -209,3 +220,69 @@ def test_capacity_forecast_excludes_orders_with_no_remaining_steps(tmp_path):
 
     by_dept, _ = build_capacity_forecast([order], GENERATED_AT, process_master, history)
     assert by_dept == []
+
+
+def test_monthly_category_capacity_derives_range_from_utilization_rate(tmp_path):
+    # 実績: GEARの過去2か月(いずれも算出時点2026-09より前)の平均10.0h -> 稼働率30-40%で逆算
+    history = ProcessHistory()
+    history._monthly_load_by_product_token[("2026-07", "ギヤ")] = 8.0
+    history._monthly_load_by_product_token[("2026-08", "ギヤ")] = 12.0  # 平均10.0
+    classifier = make_classifier(tmp_path, [("ギヤ", "GEAR")])
+    process_master = make_process_master(tmp_path, [])
+
+    entries = build_monthly_category_capacity([], GENERATED_AT, process_master, history, classifier)
+
+    aug = next(e for e in entries if e.month == "2026-08" and e.category == "GEAR")
+    assert aug.actual_hours == 12.0
+    assert round(aug.capacity_hours_low, 2) == round(10.0 / 0.40, 2)  # 保守的(稼働率40%と仮定)
+    assert round(aug.capacity_hours_high, 2) == round(10.0 / 0.30, 2)  # 楽観的(稼働率30%と仮定)
+    assert round(aug.capacity_hours_typical, 2) == round(10.0 / 0.35, 2)  # 目安(稼働率35%と仮定)
+    assert round(aug.capacity_hours_typical_per_business_day, 2) == round((10.0 / 0.35) / 20, 2)  # 月20営業日換算
+
+
+def test_monthly_category_capacity_excludes_current_partial_month_from_baseline(tmp_path):
+    history = ProcessHistory()
+    history._monthly_load_by_product_token[("2026-08", "ギヤ")] = 10.0
+    history._monthly_load_by_product_token[("2026-09", "ギヤ")] = 1.0  # 算出時点の月(まだ確定していない)
+    classifier = make_classifier(tmp_path, [("ギヤ", "GEAR")])
+    process_master = make_process_master(tmp_path, [])
+
+    entries = build_monthly_category_capacity([], GENERATED_AT, process_master, history, classifier)
+
+    sep = next(e for e in entries if e.month == "2026-09" and e.category == "GEAR")
+    assert sep.actual_hours == 1.0  # 実績としては表示する
+    # ただしキャパシティのベースラインには含めない(確定済みの08月10.0hのみで算出)
+    assert round(sep.capacity_hours_typical, 2) == round(10.0 / 0.35, 2)
+
+
+def test_monthly_category_capacity_forecast_uses_order_product_category(tmp_path):
+    order = make_order(
+        product_name="ギヤA",
+        processes=[ProcessStep(2, "TC", "F1", "d1", "d2", "オーダー確定前")],
+    )
+    process_master = make_process_master(tmp_path, [("TC", "その他", 20)])
+    history = ProcessHistory()
+    history._manhours_by_process["TC"] = [5.0]
+    classifier = make_classifier(tmp_path, [("ギヤ", "GEAR")])
+
+    entries = build_monthly_category_capacity([order], GENERATED_AT, process_master, history, classifier)
+
+    forecast_entry = next(e for e in entries if e.category == "GEAR" and e.forecast_hours is not None)
+    assert forecast_entry.forecast_hours == 5.0
+    assert forecast_entry.actual_hours is None  # 実績データが無いため
+
+
+def test_monthly_category_capacity_excludes_unclassified_products(tmp_path):
+    # 「フランジ」は品種対応表に無いキーワードなので、実績・予測どちらも3分類の対象外
+    history = ProcessHistory()
+    history._monthly_load_by_product_token[("2026-08", "フランジ")] = 10.0
+    classifier = make_classifier(tmp_path, [("ギヤ", "GEAR")])
+    process_master = make_process_master(tmp_path, [("TC", "その他", 3)])
+
+    order = make_order(
+        product_name="フランジB",
+        processes=[ProcessStep(2, "TC", "F1", "d1", "d2", "オーダー確定前")],
+    )
+
+    entries = build_monthly_category_capacity([order], GENERATED_AT, process_master, history, classifier)
+    assert entries == []

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import datetime
-from collections import Counter
+import statistics
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
 from src.models import Judgement, OrderRecord
 from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
+from src.product_category import ProductCategoryClassifier
 from src.supplier_history import SupplierHistory, SupplierSuggestion
 
 
@@ -63,6 +65,50 @@ class FeasibilityEntry:
 
 
 @dataclass
+class MonthlyCategoryCapacityEntry:
+    """品種(GEAR/BEVEL/WORM)別・月別のキャパシティ参考資料。
+
+    【2026-09-08 kii-san要望】「弊社の稼働率がだいたい30～40%くらい(24時間を100%とした場合)。
+    その観点でキャパシティが足りているか、GEAR/BEVEL/WORMの3品種で月単位に見たい。営業として
+    ざっくり月のキャパシティ感を、受注時の参考にしたい」を受けて追加。①②の判定や実績LTとは
+    独立した、追加の参考情報(--process-data指定時のみ算出)。
+
+    キャパシティ上限の考え方:
+    実際の設備上限(24時間×稼働率)そのものはこのツールからは分からないため、代わりに
+    「過去の典型的な実績工数は、稼働率30～40%の状態で出ている実績のはずだ」という
+    kii-san申告の稼働率を逆算に使う。品種別の直近実績月(算出時点の月は未確定のため除外)
+    最大12か月分の平均工数を「典型実績」とし、
+        キャパシティ = 典型実績 ÷ 稼働率
+    でキャパシティ上限を逆算する(稼働率が低いほどキャパシティは大きく出る)。
+    30%〜40%の幅をそのまま「保守的(稼働率40%と仮定)〜楽観的(稼働率30%と仮定)」の
+    レンジとして示し、中間の35%を「ざっくりの目安」の見出し数値として使う。
+    あくまで申告の稼働率レンジからの逆算であり、設備の物理的な上限を測定したものではない
+    (営業のおおまかな参考資料という位置づけ)。
+
+    月間キャパシティ目安は「1営業日あたり」にも換算する(2026-09-08 kii-san補足:
+    「弊社の平均営業日は20日」)。月ごとの実際の営業日数の違い(祝日・盆休み・年末年始等)は
+    考慮しない単純な換算(キャパシティ目安 ÷ 20日)で、感覚をつかみやすくするための参考値。
+
+    予測工数の考え方:
+    build_capacity_forecast()と同じ方式(標準LTで日程を、実績平均工数で大きさを見積もる)で、
+    仕掛中の各受注の残り工程を先の月へ積み上げる。ただし配分先は部署/設備ではなく、
+    その受注自身の品名(product_name)から分類した品種(GEAR/BEVEL/WORM)。
+    品名から品種を判定できない受注(付随部品・型番のみの表記など)は3分類の対象外として除外する
+    (実績側の集計方針と揃えている)。
+    """
+
+    month: str  # "YYYY-MM"
+    category: str  # GEAR / BEVEL / WORM
+    actual_hours: float | None  # その月の実績工数合計(品種分類できた分のみ)
+    forecast_hours: float | None  # 仕掛中受注の残り工程を積み上げた予測工数合計
+    capacity_hours_low: float | None  # 稼働率40%と仮定した場合のキャパシティ上限(保守的)
+    capacity_hours_high: float | None  # 稼働率30%と仮定した場合のキャパシティ上限(楽観的)
+    capacity_hours_typical: float | None  # 稼働率35%と仮定した場合の目安(headline数値)
+    capacity_hours_typical_per_business_day: float | None  # 上記を月平均営業日20日で割った1営業日あたりの目安
+    fulfillment_rate: float | None  # 予測工数 ÷ キャパシティ目安。1.0超で目安を超過
+
+
+@dataclass
 class ReportData:
     generated_at: datetime.date
     total_count: int
@@ -83,6 +129,8 @@ class ReportData:
     # (週初め, 部署/設備コード, 予測工数合計)のリスト。
     capacity_forecast_by_department: list[tuple[datetime.date, str, float]] = field(default_factory=list)
     capacity_forecast_by_machine: list[tuple[datetime.date, str, float]] = field(default_factory=list)
+    # 品種別(GEAR/BEVEL/WORM)月間キャパシティ(--process-data指定時のみ)。営業向けのざっくり参考資料。
+    monthly_category_capacity: list[MonthlyCategoryCapacityEntry] = field(default_factory=list)
 
 
 def build_report_data(
@@ -91,6 +139,7 @@ def build_report_data(
     process_master: ProcessMaster | None = None,
     supplier_history: SupplierHistory | None = None,
     process_history: ProcessHistory | None = None,
+    product_category_classifier: ProductCategoryClassifier | None = None,
 ) -> ReportData:
     delayed = sorted(
         (r for r in records if r.judgement == Judgement.DELAYED),
@@ -146,6 +195,7 @@ def build_report_data(
     weekly_load_by_machine: list[tuple[datetime.date, str, float]] = []
     capacity_forecast_by_department: list[tuple[datetime.date, str, float]] = []
     capacity_forecast_by_machine: list[tuple[datetime.date, str, float]] = []
+    monthly_category_capacity: list[MonthlyCategoryCapacityEntry] = []
     if process_history is not None:
         # ①②(遅延・リスク)の案件についてのみ、現在工程の代替候補設備(社内)を算出する。
         for r in (*delayed, *at_risk):
@@ -162,6 +212,11 @@ def build_report_data(
                 records, generated_at, process_master, process_history
             )
 
+            if product_category_classifier is not None:
+                monthly_category_capacity = build_monthly_category_capacity(
+                    records, generated_at, process_master, process_history, product_category_classifier
+                )
+
     return ReportData(
         generated_at=generated_at,
         total_count=len(records),
@@ -177,6 +232,7 @@ def build_report_data(
         weekly_load_by_machine=weekly_load_by_machine,
         capacity_forecast_by_department=capacity_forecast_by_department,
         capacity_forecast_by_machine=capacity_forecast_by_machine,
+        monthly_category_capacity=monthly_category_capacity,
     )
 
 
@@ -299,3 +355,103 @@ def build_capacity_forecast(
         key=lambda t: (t[0], t[1]),
     )
     return by_department, by_machine
+
+
+# 品種別月間キャパシティの前提(kii-san申告値、2026-09-08)。稼働率は24時間を100%とした値。
+CATEGORY_MONTHLY_UTILIZATION_LOW = 0.30  # 楽観的(この稼働率だったとみなすと、キャパシティ上限は高く出る)
+CATEGORY_MONTHLY_UTILIZATION_HIGH = 0.40  # 保守的(この稼働率だったとみなすと、キャパシティ上限は低く出る)
+CATEGORY_MONTHLY_UTILIZATION_TYPICAL = 0.35  # ざっくりの目安(headline数値)に使う中間値
+CATEGORY_MONTHLY_CAPACITY_BASELINE_MONTHS = 12  # 典型実績の算出に使う直近月数の上限
+CATEGORY_MONTHLY_CAPACITY_CATEGORIES = ("GEAR", "BEVEL", "WORM")
+CATEGORY_MONTHLY_AVERAGE_BUSINESS_DAYS = 20  # 弊社の平均営業日数/月(kii-san申告値、2026-09-08)
+
+
+def build_monthly_category_capacity(
+    records: list[OrderRecord],
+    generated_at: datetime.date,
+    process_master: ProcessMaster,
+    process_history: ProcessHistory,
+    classifier: ProductCategoryClassifier,
+) -> list[MonthlyCategoryCapacityEntry]:
+    """品種(GEAR/BEVEL/WORM)別・月別に、実績工数・予測工数・キャパシティ目安を並べる。
+
+    詳しい考え方はMonthlyCategoryCapacityEntryのdocstring参照。
+    """
+    # --- 実績: 月×品種の実績工数を集計(品名から品種を判定できない分は除外) ---
+    actual_by_month_category: dict[tuple[str, str], float] = defaultdict(float)
+    for month, token, hours in process_history.monthly_load_by_product_token():
+        category = classifier.classify(token)
+        if category is None:
+            continue
+        actual_by_month_category[(month, category)] += hours
+
+    # --- キャパシティ目安: 算出時点の月(未確定)を除いた直近12か月の平均実績から稼働率で逆算 ---
+    current_month = generated_at.strftime("%Y-%m")
+    months_by_category: dict[str, list[str]] = defaultdict(list)
+    for month, category in actual_by_month_category:
+        if month < current_month:
+            months_by_category[category].append(month)
+
+    capacity_by_category: dict[str, tuple[float, float, float]] = {}
+    for category in CATEGORY_MONTHLY_CAPACITY_CATEGORIES:
+        recent_months = sorted(months_by_category.get(category, []))[-CATEGORY_MONTHLY_CAPACITY_BASELINE_MONTHS:]
+        if not recent_months:
+            continue
+        typical_actual = statistics.mean(actual_by_month_category[(m, category)] for m in recent_months)
+        capacity_by_category[category] = (
+            typical_actual / CATEGORY_MONTHLY_UTILIZATION_HIGH,  # low(保守的)
+            typical_actual / CATEGORY_MONTHLY_UTILIZATION_LOW,  # high(楽観的)
+            typical_actual / CATEGORY_MONTHLY_UTILIZATION_TYPICAL,  # typical(目安)
+        )
+
+    # --- 予測: 仕掛中受注の残り工程を標準LTで先の月へ積み上げ、受注自身の品種で集計 ---
+    forecast_by_month_category: dict[tuple[str, str], float] = defaultdict(float)
+    for r in records:
+        current = r.current_process
+        if current is None:
+            continue
+        category = classifier.classify(r.product_name)
+        if category is None:
+            continue
+
+        cursor = generated_at
+        for step in (s for s in r.processes if not s.is_completed):
+            result = process_master.categorize(step.process_code)
+            cursor = _add_business_days(cursor, result.standard_lt_business_days)
+            month = cursor.strftime("%Y-%m")
+
+            hours = process_history.average_manhours_for_process(step.process_code)
+            if not hours:
+                continue
+            forecast_by_month_category[(month, category)] += hours
+
+    months = sorted({m for m, _ in actual_by_month_category} | {m for m, _ in forecast_by_month_category})
+
+    entries: list[MonthlyCategoryCapacityEntry] = []
+    for month in months:
+        for category in CATEGORY_MONTHLY_CAPACITY_CATEGORIES:
+            actual = actual_by_month_category.get((month, category))
+            forecast = forecast_by_month_category.get((month, category))
+            if actual is None and forecast is None:
+                continue
+
+            low, high, typical = capacity_by_category.get(category, (None, None, None))
+            fulfillment = (forecast / typical) if (forecast is not None and typical) else None
+            typical_per_business_day = (
+                typical / CATEGORY_MONTHLY_AVERAGE_BUSINESS_DAYS if typical is not None else None
+            )
+
+            entries.append(
+                MonthlyCategoryCapacityEntry(
+                    month=month,
+                    category=category,
+                    actual_hours=actual,
+                    forecast_hours=forecast,
+                    capacity_hours_low=low,
+                    capacity_hours_high=high,
+                    capacity_hours_typical=typical,
+                    capacity_hours_typical_per_business_day=typical_per_business_day,
+                    fulfillment_rate=fulfillment,
+                )
+            )
+    return entries
