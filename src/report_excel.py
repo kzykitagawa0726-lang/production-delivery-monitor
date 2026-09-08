@@ -1,4 +1,4 @@
-"""Excel(5〜11シート)レポート出力。
+"""Excel(5〜16シート)レポート出力。
 
 シート構成:
   1. メインサマリー
@@ -18,6 +18,17 @@
      8・9とは向き[過去/未来]が異なる別物なので混同しないよう注意)
   12. 品種別月間キャパシティ(GEAR/BEVEL/WORM)(--process-data指定時のみ。稼働率30〜40%からの
      逆算によるキャパシティ目安と、月別の実績・予測工数を品種別に並べた営業向けのざっくり参考資料)
+  13. 週別予測負荷内訳(設備別)(--process-data指定時のみ。10・11の設備別予測を、
+     どの製造オーダー・どの工程が積み上がっているかまで1行ずつ分解した内訳。
+     2026-09-08 kii-san要望:「調整必要な設備を週単位で、製造オーダー単位まで確認したい」)
+  14. 品種別月間キャパシティ内訳(--process-data指定時のみ。12の予測工数(forecast_hours)を
+     製造オーダー単位まで分解した内訳。2026-09-08 kii-san要望:「月ごとの品種別キャパシティを、
+     負荷分散のため製造オーダーに降りて確認したい」。実績側は受注単位で追えないため予測側のみ)
+  15. 仕入先週別予測(--supplier-data と --process-data の両方指定時のみ。仕入累積データに
+     工数の記録が無いため金額を使うが、個別受注・仕入先の金額は表示せず仕入先ごとの週次合計
+     金額のみを使う。社内設備のような稼働率基準が無いため、絶対的な上限ではなく「普段の
+     実績水準との比較倍率」で示す。2026-09-08 kii-san要望:「調整必要な仕入れ先を週単位で」)
+  16. 仕入先週別予測内訳(15の予測金額を製造オーダー単位まで分解した内訳)
 
 ①②リストには「代替候補(社内設備／外注仕入先)」列を追加する
 (--process-data / --supplier-data のどちらか、または両方を指定した場合のみ値が入る)。
@@ -174,8 +185,16 @@ def write_excel_report(
             wb.create_sheet("週別予測負荷(設備別)"), data.capacity_forecast_by_machine, "予測工数合計"
         )
         _write_capacity_forecast_note(wb["週別予測負荷(設備別)"])
+    if data.capacity_forecast_machine_detail:
+        _write_machine_forecast_detail_sheet(wb.create_sheet("週別予測負荷内訳(設備別)"), data)
     if data.monthly_category_capacity:
         _write_monthly_category_capacity_sheet(wb.create_sheet("品種別月間キャパシティ"), data)
+    if data.monthly_category_capacity_detail:
+        _write_monthly_category_capacity_detail_sheet(wb.create_sheet("品種別月間キャパシティ内訳"), data)
+    if data.supplier_capacity_forecast:
+        _write_supplier_capacity_forecast_sheet(wb.create_sheet("仕入先週別予測"), data)
+    if data.supplier_capacity_forecast_detail:
+        _write_supplier_capacity_forecast_detail_sheet(wb.create_sheet("仕入先週別予測内訳"), data)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -416,6 +435,123 @@ def _write_monthly_category_capacity_sheet(ws: Worksheet, data: ReportData) -> N
             "(付随部品や型番のみの表記など)は集計から除外しています。"
             "「1営業日あたり」の列は、月間キャパシティ目安を弊社の平均営業日数(月20日)で単純に"
             "割った参考値です(月ごとの実際の営業日数の違いは考慮していません)。"
+        ),
+    )
+    ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
+
+
+def _write_machine_forecast_detail_sheet(ws: Worksheet, data: ReportData) -> None:
+    """週別予測負荷(設備別)を製造オーダー単位まで分解した内訳(--process-data指定時のみ)。
+
+    1つの工程は過去の実績シェアに応じて複数の設備に按分される設計のため、同じ受注・工程が
+    複数の設備にまたがって複数行に現れる(1台に決め打ちしない。kii-san合意)。
+    """
+    headers = ["週(月曜始まり)", "設備コード", "製造オーダー№", "図番", "品名", "工程コード", "見込み工数(按分後)"]
+    _write_header_row(ws, headers)
+    rows = [
+        (e.week, e.machine_code, e.order_no, e.drawing_no, e.product_name, e.process_code, e.hours)
+        for e in data.capacity_forecast_machine_detail
+    ]
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"
+
+    note_row = ws.max_row + 2
+    ws.cell(
+        row=note_row, column=1,
+        value=(
+            "※ 「週別予測負荷(設備別)」シートの各設備・各週の合計値を、製造オーダー単位まで"
+            "分解した内訳です。1つの工程は過去の実績シェアに応じて複数の設備に按分されるため、"
+            "同じ受注・工程が複数の設備に分かれて現れます(1台に決め打ちしない設計。"
+            "見込み工数はすでに按分後の値のため、同じ受注・工程の行を全部足すと元の工数に戻ります)。"
+        ),
+    )
+    ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
+
+
+def _write_monthly_category_capacity_detail_sheet(ws: Worksheet, data: ReportData) -> None:
+    """品種別月間キャパシティの予測工数を製造オーダー単位まで分解した内訳(--process-data指定時のみ)。"""
+    headers = ["月", "品種", "製造オーダー№", "図番", "品名", "工程コード", "見込み工数"]
+    _write_header_row(ws, headers)
+    rows = [
+        (e.month, e.category, e.order_no, e.drawing_no, e.product_name, e.process_code, e.forecast_hours)
+        for e in data.monthly_category_capacity_detail
+    ]
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"
+
+    note_row = ws.max_row + 2
+    ws.cell(
+        row=note_row, column=1,
+        value=(
+            "※ 「品種別月間キャパシティ」シートの予測工数(月×品種)の元になった、"
+            "各受注・各残り工程の見込み工数を1行ずつ並べたものです(負荷分散のご検討にご利用ください)。"
+            "実績工数(過去分)は集計元データが受注単位で追えないため、内訳はありません。"
+        ),
+    )
+    ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
+
+
+def _write_supplier_capacity_forecast_sheet(ws: Worksheet, data: ReportData) -> None:
+    """仕入先(外注)週別予測(--supplier-data と --process-data の両方指定時のみ)。
+
+    個別受注・仕入先の金額は一切表示せず、仕入先ごとの週次合計金額のみを使う(kii-san合意)。
+    """
+    headers = ["週(月曜始まり)", "仕入先CD", "予測金額(合計)", "普段の週次実績金額(直近52週平均)", "普段との比率"]
+    _write_header_row(ws, headers)
+    rows: list[tuple] = []
+    for r_idx, e in enumerate(data.supplier_capacity_forecast, start=2):
+        row = (e.week, e.supplier_code, e.forecast_amount, e.typical_weekly_amount, e.ratio_to_typical)
+        rows.append(row)
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+        if e.ratio_to_typical is not None and e.ratio_to_typical > 1.5:
+            ws.cell(row=r_idx, column=1).fill = DELAYED_FILL
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"
+
+    note_row = ws.max_row + 2
+    ws.cell(
+        row=note_row, column=1,
+        value=(
+            "※ 仕入累積データには工数(時間)の記録が無いため、金額を使って算出しています。"
+            "個別の受注・仕入先ごとの金額は一切表示せず、仕入先ごとの週次合計金額のみを使っています。"
+            "社内設備のような稼働率基準(30〜40%)が無く絶対的な上限は推定できないため、"
+            "「普段の実績水準(算出時点の週を除く直近52週平均)と比べて、予測される依頼金額が"
+            "どれだけ多い/少ないか」という相対比較(比率)として示しています。過去に外注実績が"
+            "一切ない工程コードは、按分先が無いため対象外です(=社内設備側の予測のみに含まれます)。"
+            "比率1.5倍超の行を目安として強調表示していますが、あくまで参考の目安です。"
+        ),
+    )
+    ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
+
+
+def _write_supplier_capacity_forecast_detail_sheet(ws: Worksheet, data: ReportData) -> None:
+    """仕入先週別予測の、製造オーダー単位の内訳。個別金額を含むため、社内利用に留めてください。"""
+    headers = ["週(月曜始まり)", "仕入先CD", "製造オーダー№", "図番", "品名", "工程コード", "予測金額(按分後)"]
+    _write_header_row(ws, headers)
+    rows = [
+        (e.week, e.supplier_code, e.order_no, e.drawing_no, e.product_name, e.process_code, e.forecast_amount)
+        for e in data.supplier_capacity_forecast_detail
+    ]
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"
+
+    note_row = ws.max_row + 2
+    ws.cell(
+        row=note_row, column=1,
+        value=(
+            "※ 「仕入先週別予測」シートの予測金額の元になった、各受注・各残り工程の見込み金額を"
+            "1行ずつ並べたものです。1つの工程は過去の実績金額シェアに応じて複数の仕入先に按分される"
+            "ため、同じ受注・工程が複数の仕入先に分かれて現れます。"
         ),
     )
     ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")

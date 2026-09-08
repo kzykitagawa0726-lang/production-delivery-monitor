@@ -4,7 +4,15 @@ from src.models import OrderRecord, ProcessStep
 from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
 from src.product_category import ProductCategoryClassifier
-from src.report_data import build_capacity_forecast, build_feasibility_estimates, build_monthly_category_capacity
+from src.report_data import (
+    build_capacity_forecast,
+    build_capacity_forecast_machine_detail,
+    build_feasibility_estimates,
+    build_monthly_category_capacity,
+    build_monthly_category_capacity_detail,
+    build_supplier_capacity_forecast,
+)
+from src.supplier_history import SupplierHistory
 
 GENERATED_AT = datetime.date(2026, 9, 8)  # 火曜日
 
@@ -286,3 +294,100 @@ def test_monthly_category_capacity_excludes_unclassified_products(tmp_path):
 
     entries = build_monthly_category_capacity([order], GENERATED_AT, process_master, history, classifier)
     assert entries == []
+
+
+def test_capacity_forecast_machine_detail_matches_aggregate_total(tmp_path):
+    # build_capacity_forecastの集計値(2.4/1.6h、シェア0.6/0.4)と、内訳の合計が一致すること。
+    order = make_order(processes=[ProcessStep(2, "TC", "F1", "d1", "d2", "オーダー確定前")])
+    process_master = make_process_master(tmp_path, [("TC", "その他", 3)])
+
+    history = ProcessHistory()
+    history._manhours_by_process["TC"] = [4.0]
+    history._by_process["TC"]["M1"] = {"count": 3, "last_used": None}
+    history._by_process["TC"]["M2"] = {"count": 2, "last_used": None}
+
+    detail = build_capacity_forecast_machine_detail([order], GENERATED_AT, process_master, history)
+
+    week = datetime.date(2026, 9, 7)
+    assert sorted((e.machine_code, round(e.hours, 2)) for e in detail) == [("M1", 2.4), ("M2", 1.6)]
+    for e in detail:
+        assert e.week == week
+        assert e.order_no == "PO-1"
+        assert e.drawing_no == "DWG-A1"
+        assert e.process_code == "TC"
+
+
+def test_monthly_category_capacity_detail_matches_aggregate_total(tmp_path):
+    order = make_order(
+        product_name="ギヤA",
+        processes=[ProcessStep(2, "TC", "F1", "d1", "d2", "オーダー確定前")],
+    )
+    process_master = make_process_master(tmp_path, [("TC", "その他", 3)])
+    history = ProcessHistory()
+    history._manhours_by_process["TC"] = [5.0]
+    classifier = make_classifier(tmp_path, [("ギヤ", "GEAR")])
+
+    detail = build_monthly_category_capacity_detail([order], GENERATED_AT, process_master, history, classifier)
+
+    assert len(detail) == 1
+    e = detail[0]
+    assert e.month == "2026-09"
+    assert e.category == "GEAR"
+    assert e.order_no == "PO-1"
+    assert e.drawing_no == "DWG-A1"
+    assert e.process_code == "TC"
+    assert e.forecast_hours == 5.0
+
+
+def test_supplier_capacity_forecast_distributes_by_amount_share_and_flags_relative_to_typical(tmp_path):
+    # TC: 外注実績あり(仕入先9001/9002、金額シェア0.75/0.25) -> 予測対象。
+    # ZZ: 外注実績なし -> 按分先が無く自然に予測対象外(社内設備側のみに現れる想定)。
+    order = make_order(
+        processes=[
+            ProcessStep(2, "TC", "F1", "d1", "d2", "オーダー確定前"),
+            ProcessStep(3, "ZZ", "F2", "d1", "d2", "オーダー確定前"),
+        ],
+    )
+    process_master = make_process_master(tmp_path, [("TC", "その他", 3), ("ZZ", "その他", 3)])
+    process_history = ProcessHistory()
+
+    supplier_history = SupplierHistory()
+    supplier_history._by_process["TC"]["9001"] = {"count": 3, "last_used": None, "amount": 3000.0}
+    supplier_history._by_process["TC"]["9002"] = {"count": 1, "last_used": None, "amount": 1000.0}
+    # 「普段の実績水準」(算出時点の週より前の週次実績)
+    prior_week = datetime.date(2026, 8, 31)
+    supplier_history._weekly_amount_by_supplier[(prior_week, "9001")] = 400.0
+    supplier_history._weekly_amount_by_supplier[(prior_week, "9002")] = 100.0
+
+    entries, detail = build_supplier_capacity_forecast(
+        [order], GENERATED_AT, process_master, process_history, supplier_history
+    )
+
+    week = datetime.date(2026, 9, 7)
+    by_supplier = {e.supplier_code: e for e in entries}
+    assert set(by_supplier) == {"9001", "9002"}  # ZZは対象外(按分先なし)
+
+    assert round(by_supplier["9001"].forecast_amount, 2) == 750.0  # 平均金額1000 × シェア0.75
+    assert by_supplier["9001"].typical_weekly_amount == 400.0
+    assert round(by_supplier["9001"].ratio_to_typical, 3) == round(750 / 400, 3)
+
+    assert round(by_supplier["9002"].forecast_amount, 2) == 250.0
+    assert by_supplier["9002"].typical_weekly_amount == 100.0
+
+    assert all(e.week == week for e in entries)
+    assert {e.process_code for e in detail} == {"TC"}  # ZZの内訳は無い
+    assert round(sum(e.forecast_amount for e in detail if e.supplier_code == "9001"), 2) == 750.0
+
+
+def test_supplier_capacity_forecast_excludes_orders_with_no_remaining_steps(tmp_path):
+    order = make_order(processes=[ProcessStep(2, "ZZ", "F1", "d1", "d2", "作業完了")])  # 全工程完了
+    process_master = make_process_master(tmp_path, [("ZZ", "その他", 3)])
+    process_history = ProcessHistory()
+    supplier_history = SupplierHistory()
+    supplier_history._by_process["ZZ"]["9001"] = {"count": 1, "last_used": None, "amount": 100.0}
+
+    entries, detail = build_supplier_capacity_forecast(
+        [order], GENERATED_AT, process_master, process_history, supplier_history
+    )
+    assert entries == []
+    assert detail == []

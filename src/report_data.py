@@ -109,6 +109,80 @@ class MonthlyCategoryCapacityEntry:
 
 
 @dataclass
+class MonthlyCategoryCapacityDetailEntry:
+    """品種別月間キャパシティ予測(forecast_hours)の、製造オーダー単位の内訳。
+
+    【2026-09-08 kii-san要望】「月ごとの品種別キャパシティを、負荷分散をする必要があるので
+    製造オーダーに降りて確認できる様にしたい」を受けて追加。build_monthly_category_capacityの
+    forecast_hoursの元になった、各受注・各残り工程の見込み工数を1行ずつ並べたもの。
+    実績側(過去の完了済み工数)は集計元データが受注単位で追えないため、内訳は予測側のみ提供する。
+    """
+
+    month: str  # "YYYY-MM"
+    category: str  # GEAR / BEVEL / WORM
+    order_no: str
+    drawing_no: str
+    product_name: str | None
+    process_code: str
+    forecast_hours: float
+
+
+@dataclass
+class MachineForecastDetailEntry:
+    """週別予測負荷(設備別)の、製造オーダー単位の内訳。
+
+    【2026-09-08 kii-san要望】「調整必要な設備を週単位で、内訳は製造オーダーで確認したい」を
+    受けて追加。build_capacity_forecastの機械別集計の元になった、各受注・各残り工程の
+    按分結果を1行ずつ並べたもの。1つの工程は過去の実績シェアに応じて複数の設備に按分される
+    設計(1台に決め打ちしない)のため、同じ受注・工程が複数の設備にまたがって複数行に
+    現れうる(kii-san合意: 按分候補を全部表示する方針)。
+    """
+
+    week: datetime.date
+    machine_code: str
+    order_no: str
+    drawing_no: str
+    product_name: str | None
+    process_code: str
+    hours: float  # 按分後の見込み工数
+
+
+@dataclass
+class SupplierForecastEntry:
+    """仕入先(外注)週別予測。①②の判定・設備の工数ベース予測とは別の切り口。
+
+    【2026-09-08 kii-san要望】「調整必要な仕入れ先を週単位で確認したい」を受けて追加。
+    仕入累積データには工数(時間)の記録が無いため、金額(仕入先ごとの週次合計のみ。
+    個別受注・仕入先の金額は一切表示しない)を使う。また社内設備のような稼働率基準
+    (30〜40%)が無く絶対的な上限は推定できないため、「普段の実績水準
+    (直近SUPPLIER_WEEKLY_BASELINE_WEEKS週平均)と比べて、予測される依頼金額が
+    どれだけ多い/少ないか」という相対比較で示す(kii-san合意)。
+
+    過去に外注実績が一切ない工程コードは、按分先(仕入先シェア)が存在しないため
+    自然に対象外となる(=社内設備側の予測のみに現れる)。
+    """
+
+    week: datetime.date
+    supplier_code: str
+    forecast_amount: float  # 仕掛中受注の残り工程を標準LTで積み上げた予測金額(按分後合計)
+    typical_weekly_amount: float | None  # 直近実績の週平均金額(算出時点の週は未確定のため除く)
+    ratio_to_typical: float | None  # forecast_amount ÷ typical_weekly_amount
+
+
+@dataclass
+class SupplierForecastDetailEntry:
+    """仕入先週別予測の、製造オーダー単位の内訳。"""
+
+    week: datetime.date
+    supplier_code: str
+    order_no: str
+    drawing_no: str
+    product_name: str | None
+    process_code: str
+    forecast_amount: float
+
+
+@dataclass
 class ReportData:
     generated_at: datetime.date
     total_count: int
@@ -131,6 +205,14 @@ class ReportData:
     capacity_forecast_by_machine: list[tuple[datetime.date, str, float]] = field(default_factory=list)
     # 品種別(GEAR/BEVEL/WORM)月間キャパシティ(--process-data指定時のみ)。営業向けのざっくり参考資料。
     monthly_category_capacity: list[MonthlyCategoryCapacityEntry] = field(default_factory=list)
+    # 品種別月間キャパシティ予測の、製造オーダー単位の内訳(--process-data指定時のみ)。
+    monthly_category_capacity_detail: list[MonthlyCategoryCapacityDetailEntry] = field(default_factory=list)
+    # 週別予測負荷(設備別)の、製造オーダー単位の内訳(--process-data指定時のみ)。
+    capacity_forecast_machine_detail: list[MachineForecastDetailEntry] = field(default_factory=list)
+    # 仕入先(外注)週別予測(--supplier-data と --process-data の両方指定時のみ)。相対比較(倍率)。
+    supplier_capacity_forecast: list[SupplierForecastEntry] = field(default_factory=list)
+    # 仕入先週別予測の、製造オーダー単位の内訳。
+    supplier_capacity_forecast_detail: list[SupplierForecastDetailEntry] = field(default_factory=list)
 
 
 def build_report_data(
@@ -195,7 +277,11 @@ def build_report_data(
     weekly_load_by_machine: list[tuple[datetime.date, str, float]] = []
     capacity_forecast_by_department: list[tuple[datetime.date, str, float]] = []
     capacity_forecast_by_machine: list[tuple[datetime.date, str, float]] = []
+    capacity_forecast_machine_detail: list[MachineForecastDetailEntry] = []
     monthly_category_capacity: list[MonthlyCategoryCapacityEntry] = []
+    monthly_category_capacity_detail: list[MonthlyCategoryCapacityDetailEntry] = []
+    supplier_capacity_forecast: list[SupplierForecastEntry] = []
+    supplier_capacity_forecast_detail: list[SupplierForecastDetailEntry] = []
     if process_history is not None:
         # ①②(遅延・リスク)の案件についてのみ、現在工程の代替候補設備(社内)を算出する。
         for r in (*delayed, *at_risk):
@@ -211,10 +297,21 @@ def build_report_data(
             capacity_forecast_by_department, capacity_forecast_by_machine = build_capacity_forecast(
                 records, generated_at, process_master, process_history
             )
+            capacity_forecast_machine_detail = build_capacity_forecast_machine_detail(
+                records, generated_at, process_master, process_history
+            )
 
             if product_category_classifier is not None:
                 monthly_category_capacity = build_monthly_category_capacity(
                     records, generated_at, process_master, process_history, product_category_classifier
+                )
+                monthly_category_capacity_detail = build_monthly_category_capacity_detail(
+                    records, generated_at, process_master, process_history, product_category_classifier
+                )
+
+            if supplier_history is not None:
+                supplier_capacity_forecast, supplier_capacity_forecast_detail = build_supplier_capacity_forecast(
+                    records, generated_at, process_master, process_history, supplier_history
                 )
 
     return ReportData(
@@ -232,7 +329,11 @@ def build_report_data(
         weekly_load_by_machine=weekly_load_by_machine,
         capacity_forecast_by_department=capacity_forecast_by_department,
         capacity_forecast_by_machine=capacity_forecast_by_machine,
+        capacity_forecast_machine_detail=capacity_forecast_machine_detail,
         monthly_category_capacity=monthly_category_capacity,
+        monthly_category_capacity_detail=monthly_category_capacity_detail,
+        supplier_capacity_forecast=supplier_capacity_forecast,
+        supplier_capacity_forecast_detail=supplier_capacity_forecast_detail,
     )
 
 
@@ -357,6 +458,52 @@ def build_capacity_forecast(
     return by_department, by_machine
 
 
+def _walk_remaining_steps(records, generated_at, process_master):
+    """仕掛中の各受注について、残り工程を標準LTで先へ進めながら(受注, 工程, 到達日)を列挙する。
+
+    build_capacity_forecast等の集計系と、その内訳(製造オーダー単位)を返す関数群で
+    同じ「日程の進め方」を共有するための内部ヘルパー(2026-09-08 kii-san要望対応で追加)。
+    """
+    for r in records:
+        current = r.current_process
+        if current is None:
+            continue
+
+        cursor = generated_at
+        for step in (s for s in r.processes if not s.is_completed):
+            result = process_master.categorize(step.process_code)
+            cursor = _add_business_days(cursor, result.standard_lt_business_days)
+            yield r, step, cursor
+
+
+def build_capacity_forecast_machine_detail(
+    records: list[OrderRecord],
+    generated_at: datetime.date,
+    process_master: ProcessMaster,
+    process_history: ProcessHistory,
+) -> list[MachineForecastDetailEntry]:
+    """週別予測負荷(設備別)を製造オーダー単位まで分解した内訳。build_capacity_forecastと対になる。
+
+    集計値(build_capacity_forecastのby_machine)と同じ按分ロジック(実績シェアで複数設備に
+    比例配分)を使うため、両者の合計値は一致する。
+    """
+    detail: list[MachineForecastDetailEntry] = []
+    for r, step, cursor in _walk_remaining_steps(records, generated_at, process_master):
+        hours = process_history.average_manhours_for_process(step.process_code)
+        if not hours:
+            continue
+        week = _week_start(cursor)
+        for machine, share in process_history.machine_shares_for_process(step.process_code).items():
+            detail.append(
+                MachineForecastDetailEntry(
+                    week=week, machine_code=machine, order_no=r.order_no, drawing_no=r.drawing_no,
+                    product_name=r.product_name, process_code=step.process_code, hours=hours * share,
+                )
+            )
+    detail.sort(key=lambda e: (e.week, e.machine_code, -e.hours))
+    return detail
+
+
 # 品種別月間キャパシティの前提(kii-san申告値、2026-09-08)。稼働率は24時間を100%とした値。
 CATEGORY_MONTHLY_UTILIZATION_LOW = 0.30  # 楽観的(この稼働率だったとみなすと、キャパシティ上限は高く出る)
 CATEGORY_MONTHLY_UTILIZATION_HIGH = 0.40  # 保守的(この稼働率だったとみなすと、キャパシティ上限は低く出る)
@@ -455,3 +602,101 @@ def build_monthly_category_capacity(
                 )
             )
     return entries
+
+
+def build_monthly_category_capacity_detail(
+    records: list[OrderRecord],
+    generated_at: datetime.date,
+    process_master: ProcessMaster,
+    process_history: ProcessHistory,
+    classifier: ProductCategoryClassifier,
+) -> list[MonthlyCategoryCapacityDetailEntry]:
+    """品種別月間キャパシティの予測工数(forecast_hours)を製造オーダー単位まで分解した内訳。
+
+    build_monthly_category_capacityと同じ按分ロジック(標準LTで日程、実績平均工数で大きさ)を
+    使うため、両者の合計値は一致する。実績側(過去分)は集計元データが受注単位で追えないため
+    内訳は提供しない(MonthlyCategoryCapacityDetailEntryのdocstring参照)。
+    """
+    detail: list[MonthlyCategoryCapacityDetailEntry] = []
+    for r, step, cursor in _walk_remaining_steps(records, generated_at, process_master):
+        category = classifier.classify(r.product_name)
+        if category is None:
+            continue
+        hours = process_history.average_manhours_for_process(step.process_code)
+        if not hours:
+            continue
+        detail.append(
+            MonthlyCategoryCapacityDetailEntry(
+                month=cursor.strftime("%Y-%m"), category=category, order_no=r.order_no,
+                drawing_no=r.drawing_no, product_name=r.product_name, process_code=step.process_code,
+                forecast_hours=hours,
+            )
+        )
+    detail.sort(key=lambda e: (e.month, e.category, -e.forecast_hours))
+    return detail
+
+
+# 仕入先週別予測の前提(kii-san合意、2026-09-08)。
+# 社内設備のような稼働率基準(30〜40%)が無いため絶対的な上限は推定できず、
+# 「普段の実績水準」との相対比較(倍率)として示す。
+SUPPLIER_WEEKLY_BASELINE_WEEKS = 52  # 「普段の実績水準」の算出に使う直近週数の上限(算出時点の週は除く)
+
+
+def build_supplier_capacity_forecast(
+    records: list[OrderRecord],
+    generated_at: datetime.date,
+    process_master: ProcessMaster,
+    process_history: ProcessHistory,
+    supplier_history: SupplierHistory,
+) -> tuple[list[SupplierForecastEntry], list[SupplierForecastDetailEntry]]:
+    """仕掛中の全受注について、外注実績のある残り工程を標準LTで先の週へ積み上げ、
+    仕入先別の予測金額(相対比較)を算出する。詳しい考え方はSupplierForecastEntryのdocstring参照。
+    """
+    forecast_totals: dict[tuple[datetime.date, str], float] = defaultdict(float)
+    detail: list[SupplierForecastDetailEntry] = []
+
+    for r, step, cursor in _walk_remaining_steps(records, generated_at, process_master):
+        avg_amount = supplier_history.average_amount_for_process(step.process_code)
+        if not avg_amount:
+            continue
+        shares = supplier_history.supplier_amount_shares_for_process(step.process_code)
+        if not shares:
+            continue
+
+        week = _week_start(cursor)
+        for supplier, share in shares.items():
+            amount = avg_amount * share
+            forecast_totals[(week, supplier)] += amount
+            detail.append(
+                SupplierForecastDetailEntry(
+                    week=week, supplier_code=supplier, order_no=r.order_no, drawing_no=r.drawing_no,
+                    product_name=r.product_name, process_code=step.process_code, forecast_amount=amount,
+                )
+            )
+
+    # 「普段の実績水準」= 算出時点の週(未確定)より前の、直近最大SUPPLIER_WEEKLY_BASELINE_WEEKS週平均。
+    current_week = _week_start(generated_at)
+    weeks_by_supplier: dict[str, list[tuple[datetime.date, float]]] = defaultdict(list)
+    for week, supplier, amount in supplier_history.weekly_amount_by_supplier():
+        if week < current_week:
+            weeks_by_supplier[supplier].append((week, amount))
+
+    typical_by_supplier: dict[str, float] = {}
+    for supplier, points in weeks_by_supplier.items():
+        recent = sorted(points)[-SUPPLIER_WEEKLY_BASELINE_WEEKS:]
+        if recent:
+            typical_by_supplier[supplier] = statistics.mean(amount for _, amount in recent)
+
+    entries: list[SupplierForecastEntry] = []
+    for (week, supplier), forecast_amount in forecast_totals.items():
+        typical = typical_by_supplier.get(supplier)
+        ratio = (forecast_amount / typical) if typical else None
+        entries.append(
+            SupplierForecastEntry(
+                week=week, supplier_code=supplier, forecast_amount=forecast_amount,
+                typical_weekly_amount=typical, ratio_to_typical=ratio,
+            )
+        )
+    entries.sort(key=lambda e: (e.week, e.supplier_code))
+    detail.sort(key=lambda e: (e.week, e.supplier_code, -e.forecast_amount))
+    return entries, detail

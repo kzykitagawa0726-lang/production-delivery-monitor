@@ -8,8 +8,11 @@ kii-san提供の複数年分の仕入データExcel(基幹システムからの�
   図番だけで一致させると、その図番の別の工程を担当しただけの仕入先まで
   「代替候補」として出てしまい、実態と異なる提案になるため)。
   一致がなければ工程コード単位の一般的な実績にフォールバックする。
-- 仕入単価・金額はセンシティブな財務情報のため、集計結果には一切含めない
-  (件数・最終利用日のみ)。
+- 仕入単価・金額はセンシティブな財務情報のため、代替候補仕入先の提示・工程別仕入先実績
+  ランキングなど「個別の受注・仕入先」が見える集計には一切含めない(件数・最終利用日のみ)。
+  【2026-09-08 kii-san追加合意】仕入先の週別予測(調整が必要な仕入先の把握)に限り、
+  「仕入先ごとの週次合計金額」のみを内部集計に使う(個別受注・個別仕入先の金額は
+  一切表示しない。src/report_data.py の build_supplier_capacity_forecast 参照)。
 - 工程コードが空欄の行(材料そのものの仕入と推測、kii-san確認済み)は集計対象外。
 - 入力ファイルは受注データと異なり更新頻度が低く、かつ合計で数十万行規模になるため、
   集計結果のみをローカルキャッシュ(.cache/supplier_history.json、gitには含めない)に
@@ -31,7 +34,7 @@ from src.process_master import normalize_process_code
 DEFAULT_CACHE_PATH = Path(".cache/supplier_history.json")
 # 集計ロジックを変更したら上げる。ソースファイルが同じでもキャッシュを無効化し、
 # 古いロジックで集計された結果を誤って使い続けないようにするためのガード。
-CACHE_SCHEMA_VERSION = 2
+CACHE_SCHEMA_VERSION = 3
 
 # 2022年のみ列数が少ない簡易フォーマット。2023年以降は55列共通フォーマット。
 HEADER_19 = [
@@ -86,16 +89,23 @@ def _iter_rows(path: Path):
         yield idx, row
 
 
+def _week_start(d: datetime.date) -> datetime.date:
+    return d - datetime.timedelta(days=d.weekday())  # 月曜始まり
+
+
 class SupplierHistory:
     def __init__(self) -> None:
         # by_drawing_process[(図番, 工程コード)][仕入先CD] = {"count": int, "last_used": date|None}
         self._by_drawing_process: dict[tuple[str, str], dict[str, dict]] = defaultdict(lambda: defaultdict(
             lambda: {"count": 0, "last_used": None}
         ))
-        # by_process[工程コード][仕入先CD] = {"count": int, "last_used": date|None}
+        # by_process[工程コード][仕入先CD] = {"count": int, "last_used": date|None, "amount": float}
+        # amountは仕入先週別予測(相対比較)専用の内部集計で、代替候補・ランキング表示には使わない。
         self._by_process: dict[str, dict[str, dict]] = defaultdict(lambda: defaultdict(
-            lambda: {"count": 0, "last_used": None}
+            lambda: {"count": 0, "last_used": None, "amount": 0.0}
         ))
+        # weekly_amount_by_supplier[(週初め, 仕入先CD)] = 週次合計金額。仕入先週別予測の「普段の実績水準」に使う。
+        self._weekly_amount_by_supplier: dict[tuple[datetime.date, str], float] = defaultdict(float)
 
     @classmethod
     def load(cls, paths: list[Path], cache_path: Path = DEFAULT_CACHE_PATH) -> "SupplierHistory":
@@ -126,9 +136,12 @@ class SupplierHistory:
             drawing_no = str(drawing_no_raw).strip() if drawing_no_raw not in (None, "") else None
 
             date = _parse_date(row[idx["伝票日付"]])
+            amount_raw = row[idx["金額（支払額）"]]
+            amount = float(amount_raw) if isinstance(amount_raw, (int, float)) else 0.0
 
             proc_entry = self._by_process[process_code][supplier_code]
             proc_entry["count"] += 1
+            proc_entry["amount"] += amount
             if date and (proc_entry["last_used"] is None or date > proc_entry["last_used"]):
                 proc_entry["last_used"] = date
 
@@ -137,6 +150,9 @@ class SupplierHistory:
                 dp_entry["count"] += 1
                 if date and (dp_entry["last_used"] is None or date > dp_entry["last_used"]):
                     dp_entry["last_used"] = date
+
+            if date:
+                self._weekly_amount_by_supplier[(_week_start(date), supplier_code)] += amount
 
     def suggest(self, drawing_no: Optional[str], process_code: Optional[str], top_n: int = 3) -> list[SupplierSuggestion]:
         if not process_code:
@@ -169,6 +185,40 @@ class SupplierHistory:
 
         return []
 
+    # --- 仕入先週別予測(report_data.build_supplier_capacity_forecastが使用) ---
+    # 以下はいずれも「仕入先ごとの合計金額」のみを扱う(個別受注・個別行の金額は返さない)。
+
+    def average_amount_for_process(self, process_code: str) -> Optional[float]:
+        """工程コード1件あたりの典型的な仕入金額(平均)。仕入先週別予測の「大きさ」に使う。"""
+        entries = self._by_process.get(normalize_process_code(process_code))
+        if not entries:
+            return None
+        total_amount = sum(d["amount"] for d in entries.values())
+        total_count = sum(d["count"] for d in entries.values())
+        if not total_count:
+            return None
+        return total_amount / total_count
+
+    def supplier_amount_shares_for_process(self, process_code: str) -> dict[str, float]:
+        """工程コードの仕入先別シェア(実績金額比率、合計1.0)。仕入先週別予測の配分に使う。
+
+        外注実績が一切ない工程コードは空辞書を返す(=按分先が無く、自然に予測対象外となる)。
+        """
+        entries = self._by_process.get(normalize_process_code(process_code))
+        if not entries:
+            return {}
+        total = sum(d["amount"] for d in entries.values())
+        if not total:
+            return {}
+        return {supplier: d["amount"] / total for supplier, d in entries.items() if d["amount"]}
+
+    def weekly_amount_by_supplier(self) -> list[tuple[datetime.date, str, float]]:
+        """(週初め, 仕入先CD, 実績金額合計) のリスト。週初め昇順。「普段の実績水準」の算出に使う。"""
+        return sorted(
+            ((week, supplier, amount) for (week, supplier), amount in self._weekly_amount_by_supplier.items()),
+            key=lambda t: (t[0], t[1]),
+        )
+
     def to_cache_dict(self) -> dict:
         return {
             "by_drawing_process": {
@@ -186,10 +236,15 @@ class SupplierHistory:
                     supplier: {
                         "count": data["count"],
                         "last_used": data["last_used"].isoformat() if data["last_used"] else None,
+                        "amount": data["amount"],
                     }
                     for supplier, data in suppliers.items()
                 }
                 for code, suppliers in self._by_process.items()
+            },
+            "weekly_amount_by_supplier": {
+                f"{week.isoformat()}\x1f{supplier}": amount
+                for (week, supplier), amount in self._weekly_amount_by_supplier.items()
             },
         }
 
@@ -207,6 +262,10 @@ class SupplierHistory:
                 entry = history._by_process[code][supplier]
                 entry["count"] = data["count"]
                 entry["last_used"] = datetime.date.fromisoformat(data["last_used"]) if data["last_used"] else None
+                entry["amount"] = data.get("amount", 0.0)
+        for key, amount in payload.get("weekly_amount_by_supplier", {}).items():
+            week_str, supplier = key.split("\x1f", 1)
+            history._weekly_amount_by_supplier[(datetime.date.fromisoformat(week_str), supplier)] = amount
         return history
 
 
