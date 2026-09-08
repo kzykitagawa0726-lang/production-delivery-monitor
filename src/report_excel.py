@@ -9,6 +9,11 @@
      --process-data指定時は「参考実績LT(暦日)」列も追加。標準LT(営業日)は変更しない)
   6. 工程別仕入先実績ランキング(--supplier-data指定時のみ。仕入累積データから
      工程コード別に実績の多い仕入先を集計)
+  7. 実績ベース納期充足予測(--process-data指定時のみ。進行中の受注について、
+     残り工程の実績LTを積み上げた予測完了日と顧客納期を比較する。①②の判定
+     [自社納期・残日ベース]とは独立した参考情報)
+  8. 週別負荷(部署別)(--process-data指定時のみ。週×部署コードの実績工数ピボット)
+  9. 週別負荷(設備別)(--process-data指定時のみ。週別・設備別の実績工数一覧)
 
 ①②リストには「代替候補(社内設備／外注仕入先)」列を追加する
 (--process-data / --supplier-data のどちらか、または両方を指定した場合のみ値が入る)。
@@ -141,6 +146,12 @@ def write_excel_report(
     _write_congestion_sheet(wb.create_sheet("工程別仕掛中ランキング"), data)
     if data.supplier_ranking_by_process:
         _write_supplier_ranking_sheet(wb.create_sheet("工程別仕入先実績ランキング"), data)
+    if data.feasibility_estimates:
+        _write_feasibility_sheet(wb.create_sheet("実績ベース納期充足予測"), data)
+    if data.weekly_load_by_department:
+        _write_weekly_load_department_sheet(wb.create_sheet("週別負荷(部署別)"), data)
+    if data.weekly_load_by_machine:
+        _write_weekly_load_machine_sheet(wb.create_sheet("週別負荷(設備別)"), data)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -247,6 +258,82 @@ def _write_supplier_ranking_sheet(ws: Worksheet, data: ReportData) -> None:
     for process_code, suggestions in data.supplier_ranking_by_process.items():
         for rank, s in enumerate(suggestions, start=1):
             rows.append((process_code, rank, s.supplier_code, s.count, s.last_used))
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"
+
+
+def _write_feasibility_sheet(ws: Worksheet, data: ReportData) -> None:
+    """残り工程の実績LTを積み上げた客先納期充足予測(--process-data指定時のみ)。
+
+    ①②(自社納期・残日ベース)の判定とは独立した参考情報。margin_days昇順
+    (間に合わない見込み・データ不足が上に来る)。
+    """
+    headers = [
+        "製造オーダー№", "図番", "品名", "顧客納期", "現在工程", "残り工程数",
+        "予測残日数(暦日)", "予測完了日", "余裕日数(顧客納期-予測完了日)", "判定", "実績データ不足の工程",
+    ]
+    _write_header_row(ws, headers)
+    rows: list[tuple] = []
+    for r_idx, e in enumerate(data.feasibility_estimates, start=2):
+        row = (
+            e.order_no, e.drawing_no, e.product_name, e.customer_deadline, e.current_process_code,
+            e.remaining_step_count, e.predicted_remaining_calendar_days, e.predicted_completion_date,
+            e.margin_days, e.status, ", ".join(e.missing_process_codes) or None,
+        )
+        rows.append(row)
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+        if e.status == "間に合わない見込み":
+            ws.cell(row=r_idx, column=1).fill = DELAYED_FILL
+        elif e.status == "データ不足":
+            ws.cell(row=r_idx, column=1).fill = UNDETERMINED_FILL
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"
+
+    note_row = ws.max_row + 2
+    ws.cell(
+        row=note_row, column=1,
+        value=(
+            "※ この予測は①②の判定(自社納期・残日ベース)とは独立した参考情報です。"
+            "残り工程の実績LT(暦日)を積み上げて予測完了日を算出し、顧客納期と比較しています。"
+            "実績データ不足の工程がある行は、予測が過小評価(=実際はもっとかかる)の可能性があります。"
+        ),
+    )
+    ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
+
+
+def _write_weekly_load_department_sheet(ws: Worksheet, data: ReportData) -> None:
+    """週別・部署別の実績工数(週を行、部署コードを列とするピボット表)。
+
+    「加工先」列(数値・13種類)を部署/コストセンターコードとして扱う(kii-san確認)。
+    週は完成日が属する月曜始まりの週(MVP。着手〜完成にまたがる稼働の日別按分はしていない)。
+    """
+    departments = sorted({dept for _, dept, _ in data.weekly_load_by_department})
+    weeks = sorted({week for week, _, _ in data.weekly_load_by_department})
+    grid: dict[tuple, float] = {(week, dept): hours for week, dept, hours in data.weekly_load_by_department}
+
+    headers = ["週(月曜始まり)", *departments, "合計"]
+    _write_header_row(ws, headers)
+    rows: list[tuple] = []
+    for week in weeks:
+        values = [grid.get((week, dept), 0.0) for dept in departments]
+        row = (week, *values, sum(values))
+        rows.append(row)
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "B2"
+
+
+def _write_weekly_load_machine_sheet(ws: Worksheet, data: ReportData) -> None:
+    """週別・設備別の実績工数(設備数が多いため縦持ちの一覧形式。週降順→工数降順)。"""
+    headers = ["週(月曜始まり)", "設備コード", "実績工数合計"]
+    _write_header_row(ws, headers)
+    rows = sorted(data.weekly_load_by_machine, key=lambda t: (t[0], -t[2]))
     for r_idx, row in enumerate(rows, start=2):
         for c_idx, value in enumerate(row, start=1):
             ws.cell(row=r_idx, column=c_idx, value=value)

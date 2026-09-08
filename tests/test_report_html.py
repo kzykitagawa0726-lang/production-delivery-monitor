@@ -2,6 +2,7 @@ import datetime
 
 from src.judge import judge_record
 from src.models import OrderRecord, ProcessStep
+from src.process_history import ProcessHistory
 from src.process_master import ProcessMaster
 from src.report_data import build_report_data
 from src.report_html import write_html_report
@@ -48,3 +49,21 @@ def test_write_html_report_is_self_contained_and_has_no_external_refs(tmp_path):
     assert "ORD-DELAYED" in content
     assert "ORD-RISK" in content
     assert "<svg" in content  # 工程別仕掛中ランキングのグラフ
+
+
+def test_write_html_report_shows_feasibility_and_weekly_load(tmp_path):
+    record = make_judged_record(order_no="ORD-RISK", remaining_business_days=2)
+
+    process_history = ProcessHistory()
+    process_history._actual_durations["CR"] = [200]  # 客先納期に対して大幅に不足する想定
+    process_history._weekly_load_by_department[(datetime.date(2026, 7, 27), "1223")] = 12.5
+
+    data = build_report_data([record], BASE_DATE, ProcessMaster(), process_history=process_history)
+    output_path = tmp_path / "report.html"
+
+    write_html_report(data, output_path)
+
+    content = output_path.read_text(encoding="utf-8")
+    assert "実績ベースで納期に間に合わない見込み" in content
+    assert "週別負荷" in content
+    assert "部署1223" in content

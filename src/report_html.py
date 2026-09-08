@@ -46,6 +46,88 @@ def _top_list_rows(records: list[OrderRecord], kind: str) -> str:
     return "".join(rows)
 
 
+WEEKLY_CHART_WEEKS = 16
+WEEKLY_CHART_TOP_DEPARTMENTS = 8
+LINE_COLORS = [
+    "#4f7cff", "#e35d5d", "#f0ad4e", "#2ea043", "#9a6fd8",
+    "#17a2b8", "#d6336c", "#6c757d",
+]
+
+
+def _weekly_load_chart_svg(data: ReportData) -> str:
+    """直近WEEKLY_CHART_WEEKS週分の、部署別 週次実績工数の折れ線グラフ(上位のみ)。
+
+    部署数(13種類)が多いため、直近期間内の合計工数が多い上位のみを表示し、
+    全期間・全設備の詳細はExcelの「週別負荷」シートを参照する形にする。
+    """
+    points = data.weekly_load_by_department
+    if not points:
+        return "<p>工程累積データが指定されていません。</p>"
+
+    weeks = sorted({week for week, _, _ in points})[-WEEKLY_CHART_WEEKS:]
+    week_set = set(weeks)
+
+    totals: dict[str, float] = {}
+    grid: dict[tuple, float] = {}
+    for week, dept, hours in points:
+        if week in week_set:
+            totals[dept] = totals.get(dept, 0.0) + hours
+            grid[(week, dept)] = hours
+
+    top_departments = [d for d, _ in sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:WEEKLY_CHART_TOP_DEPARTMENTS]]
+    if not top_departments or not weeks:
+        return "<p>直近期間の工程累積データがありません。</p>"
+
+    chart_width, chart_height = 640, 260
+    margin_left, margin_bottom, margin_top = 40, 30, 10
+    plot_w = chart_width - margin_left - 10
+    plot_h = chart_height - margin_top - margin_bottom
+    max_hours = max((grid.get((w, d), 0.0) for w in weeks for d in top_departments), default=0.0) or 1.0
+    step_x = plot_w / max(len(weeks) - 1, 1)
+
+    def xy(i: int, hours: float) -> tuple[float, float]:
+        x = margin_left + i * step_x
+        y = margin_top + plot_h - (hours / max_hours) * plot_h
+        return x, y
+
+    lines = []
+    legend = []
+    for ci, dept in enumerate(top_departments):
+        color = LINE_COLORS[ci % len(LINE_COLORS)]
+        coords = [xy(i, grid.get((w, dept), 0.0)) for i, w in enumerate(weeks)]
+        path = " ".join(f"{x:.1f},{y:.1f}" for x, y in coords)
+        lines.append(f'<polyline points="{path}" fill="none" stroke="{color}" stroke-width="2"></polyline>')
+        legend.append(
+            f'<span style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;">'
+            f'<span style="width:10px;height:10px;background:{color};border-radius:2px;display:inline-block;"></span>'
+            f"部署{_esc(dept)}</span>"
+        )
+
+    x_labels = []
+    label_every = max(len(weeks) // 8, 1)
+    for i, w in enumerate(weeks):
+        if i % label_every == 0 or i == len(weeks) - 1:
+            x, _ = xy(i, 0)
+            x_labels.append(
+                f'<text x="{x:.1f}" y="{chart_height - 8}" text-anchor="middle" class="chart-label">'
+                f"{w.strftime('%m/%d')}</text>"
+            )
+
+    y_labels = []
+    for frac in (0, 0.5, 1.0):
+        y = margin_top + plot_h - frac * plot_h
+        val = max_hours * frac
+        y_labels.append(f'<text x="4" y="{y + 4:.1f}" class="chart-value">{val:.0f}</text>')
+
+    svg = (
+        f'<svg viewBox="0 0 {chart_width} {chart_height}" width="100%" height="{chart_height}" '
+        'role="img" aria-label="週別部署別実績工数">'
+        + "".join(y_labels) + "".join(x_labels) + "".join(lines)
+        + "</svg>"
+    )
+    return svg + '<div style="margin-top:8px;">' + "".join(legend) + "</div>"
+
+
 def _congestion_bar_chart_svg(data: ReportData) -> str:
     entries = data.congestion_ranking[:CHART_TOP_N]
     if not entries:
@@ -99,6 +181,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .card.risk {{ border-top-color: #f0ad4e; }}
   .card.undetermined {{ border-top-color: #9aa0a6; }}
   .card.forecast {{ border-top-color: #4f7cff; }}
+  .card.infeasible {{ border-top-color: #d6336c; }}
   .card .label {{ font-size: 0.9rem; color: #6b7280; }}
   .card .value {{ font-size: 2.2rem; font-weight: 700; margin-top: 4px; }}
   section {{ background: #fff; border-radius: 10px; padding: 20px 24px; margin-bottom: 24px;
@@ -110,6 +193,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .chart-label {{ font-size: 12px; fill: #1f2430; }}
   .chart-value {{ font-size: 12px; fill: #1f2430; }}
   .warning {{ color: #9c0006; font-size: 0.85rem; margin-top: 8px; }}
+  .note {{ color: #6b7280; font-size: 0.85rem; margin-top: 8px; }}
   @media (prefers-color-scheme: dark) {{
     body {{ background: #14161a; color: #e5e7eb; }}
     .card, section {{ background: #1f2229; box-shadow: none; border: 1px solid #2c313a; }}
@@ -127,6 +211,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     <div class="card risk"><div class="label">② 納期遅延リスク(残5営業日以内)</div><div class="value">{risk_count}</div></div>
     <div class="card undetermined"><div class="label">判定不能・要確認</div><div class="value">{undetermined_count}</div></div>
     <div class="card forecast"><div class="label">(参考)内示・先行手配</div><div class="value">{forecast_count}</div></div>
+    <div class="card infeasible"><div class="label">(参考)実績ベースで納期に間に合わない見込み</div><div class="value">{infeasible_count}</div></div>
   </div>
 
   <section>
@@ -150,6 +235,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
     {congestion_chart}
     {unknown_warning}
   </section>
+
+  <section>
+    <h2>週別負荷 上位部署(直近{weekly_chart_weeks}週、実績工数)</h2>
+    {weekly_load_chart}
+    <p class="note">※ 全部署・全設備・全期間の詳細はExcelの「週別負荷」シートをご覧ください。</p>
+  </section>
 </body>
 </html>
 """
@@ -164,6 +255,9 @@ def write_html_report(data: ReportData, output_path: Path) -> None:
             "対応表が届き次第、正しいカテゴリ・ボトルネック区分に更新されます。</p>"
         )
 
+    infeasible_count = sum(1 for e in data.feasibility_estimates if e.status == "間に合わない見込み")
+    infeasible_display = infeasible_count if data.feasibility_estimates else "—"
+
     page = PAGE_TEMPLATE.format(
         generated_at=_esc(data.generated_at.isoformat()),
         total_count=data.total_count,
@@ -171,11 +265,14 @@ def write_html_report(data: ReportData, output_path: Path) -> None:
         risk_count=len(data.at_risk),
         undetermined_count=len(data.undetermined),
         forecast_count=data.forecast_order_count,
+        infeasible_count=infeasible_display,
         top_n=TOP_N,
         delayed_rows=_top_list_rows(data.delayed, "delayed"),
         risk_rows=_top_list_rows(data.at_risk, "risk"),
         congestion_chart=_congestion_bar_chart_svg(data),
         unknown_warning=unknown_warning,
+        weekly_chart_weeks=WEEKLY_CHART_WEEKS,
+        weekly_load_chart=_weekly_load_chart_svg(data),
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -25,6 +25,34 @@ class CongestionEntry:
 
 
 @dataclass
+class FeasibilityEntry:
+    """進行中の受注について、残り工程の実績LTを積み上げた客先納期充足予測。
+
+    ①②の判定(自社納期・残日ベース)とは独立した、追加の参考情報。
+    --process-data指定時のみ算出される。
+    """
+
+    order_no: str
+    drawing_no: str
+    product_name: str | None
+    customer_deadline: datetime.date
+    current_process_code: str
+    remaining_step_count: int
+    predicted_remaining_calendar_days: float | None  # 実績データが1件もなければNone
+    predicted_completion_date: datetime.date | None
+    margin_days: int | None  # 顧客納期 - 予測完了日。正=間に合う見込み、負=間に合わない見込み
+    missing_process_codes: list[str] = field(default_factory=list)
+
+    @property
+    def status(self) -> str:
+        if self.predicted_completion_date is None:
+            return "データ不足"
+        if self.margin_days is not None and self.margin_days < 0:
+            return "間に合わない見込み"
+        return "間に合う見込み"
+
+
+@dataclass
 class ReportData:
     generated_at: datetime.date
     total_count: int
@@ -36,6 +64,11 @@ class ReportData:
     unknown_process_codes: list[str] = field(default_factory=list)
     # 工程コード別の仕入先実績ランキング(--supplier-data指定時のみ)。上位5社まで。
     supplier_ranking_by_process: dict[str, list[SupplierSuggestion]] = field(default_factory=dict)
+    # 実績ベース納期充足予測(--process-data指定時のみ)。margin_days昇順(危険な順)。
+    feasibility_estimates: list[FeasibilityEntry] = field(default_factory=list)
+    # 週別負荷(--process-data指定時のみ)。(週初め, 部署/設備コード, 実績工数合計)のリスト。
+    weekly_load_by_department: list[tuple[datetime.date, str, float]] = field(default_factory=list)
+    weekly_load_by_machine: list[tuple[datetime.date, str, float]] = field(default_factory=list)
 
 
 def build_report_data(
@@ -94,12 +127,19 @@ def build_report_data(
             if suggestions:
                 supplier_ranking_by_process[entry.process_code] = suggestions
 
+    feasibility_estimates: list[FeasibilityEntry] = []
+    weekly_load_by_department: list[tuple[datetime.date, str, float]] = []
+    weekly_load_by_machine: list[tuple[datetime.date, str, float]] = []
     if process_history is not None:
         # ①②(遅延・リスク)の案件についてのみ、現在工程の代替候補設備(社内)を算出する。
         for r in (*delayed, *at_risk):
             current = r.current_process
             if current is not None:
                 r.machine_suggestions = process_history.suggest_machines(r.drawing_no, current.process_code)
+
+        feasibility_estimates = build_feasibility_estimates(records, generated_at, process_history)
+        weekly_load_by_department = process_history.weekly_load_by_department()
+        weekly_load_by_machine = process_history.weekly_load_by_machine()
 
     return ReportData(
         generated_at=generated_at,
@@ -111,4 +151,61 @@ def build_report_data(
         congestion_ranking=congestion_ranking,
         unknown_process_codes=process_master.get_unknown_codes() if process_master is not None else [],
         supplier_ranking_by_process=supplier_ranking_by_process,
+        feasibility_estimates=feasibility_estimates,
+        weekly_load_by_department=weekly_load_by_department,
+        weekly_load_by_machine=weekly_load_by_machine,
     )
+
+
+def build_feasibility_estimates(
+    records: list[OrderRecord],
+    generated_at: datetime.date,
+    process_history: ProcessHistory,
+) -> list[FeasibilityEntry]:
+    """進行中の全受注について、残り工程の実績LTを積み上げた客先納期充足予測を作る。
+
+    ①②(自社納期・残日ベース)の判定とは独立(kii-san合意)。対象は
+    「現在工程があり、かつ顧客納期が分かっている」受注のみ(それ以外は比較対象なしのため対象外)。
+    margin_days(顧客納期 - 予測完了日)が小さい(=危険な)順に並べる。データ不足は最後。
+    """
+    entries: list[FeasibilityEntry] = []
+    for r in records:
+        current = r.current_process
+        if current is None or r.customer_deadline is None:
+            continue
+
+        remaining_steps = [s for s in r.processes if not s.is_completed]
+        total_days = 0.0
+        missing: list[str] = []
+        any_known = False
+        for step in remaining_steps:
+            lt = process_history.actual_lt_calendar_days_median(step.process_code, r.drawing_no)
+            if lt is None:
+                missing.append(step.process_code)
+            else:
+                total_days += lt
+                any_known = True
+
+        predicted_days = total_days if any_known else None
+        predicted_date = (
+            generated_at + datetime.timedelta(days=round(predicted_days)) if predicted_days is not None else None
+        )
+        margin = (r.customer_deadline - predicted_date).days if predicted_date is not None else None
+
+        entries.append(
+            FeasibilityEntry(
+                order_no=r.order_no,
+                drawing_no=r.drawing_no,
+                product_name=r.product_name,
+                customer_deadline=r.customer_deadline,
+                current_process_code=current.process_code,
+                remaining_step_count=len(remaining_steps),
+                predicted_remaining_calendar_days=predicted_days,
+                predicted_completion_date=predicted_date,
+                margin_days=margin,
+                missing_process_codes=missing,
+            )
+        )
+
+    entries.sort(key=lambda e: (e.margin_days is None, e.margin_days if e.margin_days is not None else 0))
+    return entries
