@@ -79,6 +79,10 @@ class OrderRecord:
     material_arrived: bool = False  # スロット1の固定文言「材料入荷済み」の有無
     processes: list[ProcessStep] = field(default_factory=list)  # スロット2〜20
 
+    # 仕入(外注)累積データ(--supplier-data)が渡された場合のみ設定される代替候補仕入先。
+    # 現在工程(current_process)について、図番一致→工程コード一致の優先順で算出する。
+    supplier_suggestions: list = field(default_factory=list)  # list[SupplierSuggestion]
+
     judgement: Optional[Judgement] = None
     judgement_reason: Optional[str] = None
 

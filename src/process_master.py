@@ -23,6 +23,19 @@ DEFAULT_CATEGORIES_PATH = Path("config/process_categories.json")
 DEFAULT_MASTER_CSV_PATH = Path("config/process_code_master.csv")
 
 
+def normalize_process_code(process_code: str) -> str:
+    """1桁の数値コードは対応表側がゼロ埋め表記(例:"05")のため、参照側もゼロ埋めして揃える。
+
+    仕入データはExcelの数値セルとして "5" のように読めてしまうため、
+    工程コード対応表と突き合わせる前に正規化する(process_master.py・
+    supplier_history.py共通で使用)。
+    """
+    code = str(process_code).strip()
+    if code.isdigit() and len(code) == 1:
+        return code.zfill(2)
+    return code
+
+
 @dataclass
 class CategoryResult:
     category: str
@@ -57,6 +70,7 @@ class ProcessMaster:
         self._unknown_codes: set[str] = set()
 
     def categorize(self, process_code: str) -> CategoryResult:
+        process_code = normalize_process_code(process_code)
         entry = self._code_map.get(process_code)
         if entry is None:
             self._unknown_codes.add(process_code)

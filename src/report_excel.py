@@ -1,4 +1,4 @@
-"""Excel(5シート)レポート出力。
+"""Excel(5〜6シート)レポート出力。
 
 シート構成:
   1. メインサマリー
@@ -6,15 +6,18 @@
   3. ②納期遅延リスクリスト(危険度順)
   4. 判定不能・要確認リスト
   5. 工程別仕掛中ランキング(現在停滞している工程コード別。ボトルネック候補を強調)
+  6. 工程別仕入先実績ランキング(--supplier-data指定時のみ。仕入累積データから
+     工程コード別に実績の多い仕入先を集計。①②リストにも代替候補仕入先列を追加する)
 
-工程コード→カテゴリの対応表(PDF由来)が未着の間は、シート5のカテゴリ・
-ボトルネック表示はすべて「その他(未分類)」となる。届き次第、
-config/process_code_master.csv を更新すれば自動的に反映される。
+工程コード→カテゴリの対応表が未整備の間は、シート5のカテゴリ・ボトルネック表示は
+すべて「その他(未分類)」となる。届き次第、config/process_code_master.csv を
+更新すれば自動的に反映される。
 """
 from __future__ import annotations
 
 import datetime
 from pathlib import Path
+from typing import Optional
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -23,6 +26,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 from src.models import OrderRecord
 from src.process_master import ProcessMaster
 from src.report_data import ReportData, build_report_data
+from src.supplier_history import SupplierHistory
 
 HEADER_FILL = PatternFill(start_color="FF305496", end_color="FF305496", fill_type="solid")
 HEADER_FONT = Font(bold=True, color="FFFFFFFF")
@@ -56,6 +60,12 @@ def _current_process_label(r: OrderRecord) -> str:
     return f"{step.process_code} / {step.status}"
 
 
+def _supplier_suggestions_label(r: OrderRecord) -> Optional[str]:
+    if not r.supplier_suggestions:
+        return None
+    return "; ".join(s.label for s in r.supplier_suggestions)
+
+
 def _common_row(r: OrderRecord) -> tuple:
     return (
         r.order_no, r.drawing_no, r.product_name, r.qty, r.customer_order_no,
@@ -63,13 +73,14 @@ def _common_row(r: OrderRecord) -> tuple:
         _current_process_label(r),
         "はい" if r.is_forecast_order else "",
         r.sales_note or (r.sales_agreed_deadline.isoformat() if r.sales_agreed_deadline else None),
-        r.customer_no, r.old_system_no,
+        r.customer_no, r.old_system_no, _supplier_suggestions_label(r),
     )
 
 
 COMMON_HEADERS = [
     "製造オーダー№", "図番", "品名", "数量", "客先注番", "自社納期", "顧客納期",
     "対顧客納期差(日)", "現在工程/ステータス", "内示・先行手配", "営業メモ(納期確認等)", "得意先NO", "製番",
+    "代替候補仕入先",
 ]
 
 
@@ -93,8 +104,9 @@ def write_excel_report(
     output_path: Path,
     generated_at: datetime.date,
     process_master: ProcessMaster | None = None,
+    supplier_history: SupplierHistory | None = None,
 ) -> None:
-    data = build_report_data(records, generated_at, process_master)
+    data = build_report_data(records, generated_at, process_master, supplier_history)
 
     wb = Workbook()
 
@@ -119,6 +131,8 @@ def write_excel_report(
         highlight_fill=UNDETERMINED_FILL,
     )
     _write_congestion_sheet(wb.create_sheet("工程別仕掛中ランキング"), data)
+    if data.supplier_ranking_by_process:
+        _write_supplier_ranking_sheet(wb.create_sheet("工程別仕入先実績ランキング"), data)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output_path)
@@ -210,3 +224,21 @@ def _write_congestion_sheet(ws: Worksheet, data: ReportData) -> None:
             ),
         )
         ws.cell(row=note_row, column=1).font = Font(italic=True, color="FF9C0006")
+
+
+def _write_supplier_ranking_sheet(ws: Worksheet, data: ReportData) -> None:
+    """工程コード別に、過去の仕入(外注)実績の多い仕入先を並べる(--supplier-data指定時のみ)。
+
+    仕入単価・金額は含めない(件数・最終利用日のみ。kii-san合意事項)。
+    """
+    headers = ["工程コード", "順位", "仕入先CD", "実績件数", "最終利用日"]
+    _write_header_row(ws, headers)
+    rows: list[tuple] = []
+    for process_code, suggestions in data.supplier_ranking_by_process.items():
+        for rank, s in enumerate(suggestions, start=1):
+            rows.append((process_code, rank, s.supplier_code, s.count, s.last_used))
+    for r_idx, row in enumerate(rows, start=2):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(row=r_idx, column=c_idx, value=value)
+    _autosize_columns(ws, headers, rows)
+    ws.freeze_panes = "A2"

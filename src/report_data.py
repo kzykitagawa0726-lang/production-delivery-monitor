@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from src.models import Judgement, OrderRecord
 from src.process_master import ProcessMaster
+from src.supplier_history import SupplierHistory, SupplierSuggestion
 
 
 @dataclass
@@ -29,12 +30,15 @@ class ReportData:
     forecast_order_count: int  # 内示・先行手配(受注日・顧客納期未設定)と思われる件数。参考情報。
     congestion_ranking: list[CongestionEntry] = field(default_factory=list)
     unknown_process_codes: list[str] = field(default_factory=list)
+    # 工程コード別の仕入先実績ランキング(--supplier-data指定時のみ)。上位5社まで。
+    supplier_ranking_by_process: dict[str, list[SupplierSuggestion]] = field(default_factory=dict)
 
 
 def build_report_data(
     records: list[OrderRecord],
     generated_at: datetime.date,
     process_master: ProcessMaster | None = None,
+    supplier_history: SupplierHistory | None = None,
 ) -> ReportData:
     delayed = sorted(
         (r for r in records if r.judgement == Judgement.DELAYED),
@@ -68,6 +72,19 @@ def build_report_data(
                 )
             )
 
+    supplier_ranking_by_process: dict[str, list[SupplierSuggestion]] = {}
+    if supplier_history is not None:
+        # ①②(遅延・リスク)の案件についてのみ、現在工程の代替候補仕入先を算出する。
+        for r in (*delayed, *at_risk):
+            current = r.current_process
+            if current is not None:
+                r.supplier_suggestions = supplier_history.suggest(r.drawing_no, current.process_code)
+
+        for entry in congestion_ranking:
+            suggestions = supplier_history.suggest(None, entry.process_code, top_n=5)
+            if suggestions:
+                supplier_ranking_by_process[entry.process_code] = suggestions
+
     return ReportData(
         generated_at=generated_at,
         total_count=len(records),
@@ -77,4 +94,5 @@ def build_report_data(
         forecast_order_count=forecast_order_count,
         congestion_ranking=congestion_ranking,
         unknown_process_codes=process_master.get_unknown_codes() if process_master is not None else [],
+        supplier_ranking_by_process=supplier_ranking_by_process,
     )

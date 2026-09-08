@@ -64,6 +64,15 @@ def test_undetermined_when_remaining_days_anomalously_large():
     assert "異常" in record.judgement_reason
 
 
+def test_undetermined_when_remaining_days_anomalously_overdue():
+    # 実データで確認された、安全在庫案件(自社納期が数年前の固定値)を想定。
+    # ①遅延として埋もれさせず、判定不能として設定変更の必要性が分かるようにする(kii-san確認済み)。
+    record = make_record(remaining_business_days=-(ANOMALY_THRESHOLD_BUSINESS_DAYS + 1))
+    judge_record(record)
+    assert record.judgement == Judgement.UNDETERMINED
+    assert "設定変更" in record.judgement_reason
+
+
 def test_forecast_order_is_still_judged_normally():
     # 内示・先行手配(受注日・顧客納期未設定)でも、自社納期・残日があれば通常通り判定する
     record = make_record(order_date=None, customer_deadline=None, remaining_business_days=-2, is_forecast_order=True)
