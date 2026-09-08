@@ -4,7 +4,7 @@
 使い方:
     python analyze.py 今週の受注データ.xlsx
 
-実行のたびに output/YYYYMMDD/ フォルダを作成し、Excel(4シート)と
+実行のたびに output/YYYYMMDD/ フォルダを作成し、Excel(5シート)と
 オフラインHTMLレポートを出力する。外部API・外部通信は使用しない。
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ from pathlib import Path
 
 from src.excel_io import load_orders
 from src.judge import judge_record
+from src.process_master import ProcessMaster
 from src.report_data import build_report_data
 from src.report_excel import write_excel_report
 from src.report_html import write_html_report
@@ -23,14 +24,15 @@ from src.report_html import write_html_report
 
 def run(input_path: Path, today: datetime.date, output_root: Path) -> Path:
     orders = load_orders(input_path)
+    process_master = ProcessMaster()
 
     for order in orders:
         judge_record(order)
 
-    report_data = build_report_data(orders, today)
+    report_data = build_report_data(orders, today, process_master)
 
     output_dir = output_root / today.strftime("%Y%m%d")
-    write_excel_report(orders, output_dir / "production_delivery_report.xlsx", today)
+    write_excel_report(orders, output_dir / "production_delivery_report.xlsx", today, process_master)
     write_html_report(report_data, output_dir / "production_delivery_report.html")
 
     return output_dir
